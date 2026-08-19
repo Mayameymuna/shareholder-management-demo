@@ -1,0 +1,3847 @@
+require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
+const jwt = require('jsonwebtoken');
+const mysql = require('mysql2');
+const multer = require('multer');
+const path = require('path');
+const csv = require('csv-parser');
+const fs = require('fs');
+
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+app.use('/documents', express.static(path.join(__dirname, 'documents')));
+
+
+// 2. DATABASE CONNECTION
+const db = mysql.createConnection({
+    host: process.env.DB_HOST,
+    user: process.env.DB_USER,
+    password: process.env.DB_PASS,
+    database: process.env.DB_NAME
+});
+const SECRET_KEY = process.env.JWT_SECRET;
+
+function handleDisconnect() {
+    console.log('🔄 Connecting to Database...');
+    db.connect((err) => {
+        if (err) {
+            console.log('❌ Error connecting to db:', err);
+            setTimeout(handleDisconnect, 2000); // Try again in 2 seconds
+        } else {
+            console.log('✅ Connected to MySQL: rammis_sms_db');
+        }
+    });
+
+    db.on('error', (err) => {
+        console.log('⚠️ Database error', err);
+        if (err.code === 'PROTOCOL_CONNECTION_LOST') {
+            handleDisconnect(); // Reconnect if connection is lost
+        } else {
+            throw err;
+        }
+    });
+}
+
+handleDisconnect();
+
+const logAction = (sh_id, action, user, details) => {
+    const query = "INSERT INTO audit_logs (shareholder_id, action_type, performed_by, details) VALUES (?, ?, ?, ?)";
+    // details should be a JSON object converted to string
+    db.execute(query, [sh_id, action, user, JSON.stringify(details)], (err) => {
+        if (err) console.error("Audit Log Error:", err);
+    });
+};
+
+// 3. CONFIGURE STORAGE FOR DOCUMENTS
+const storage = multer.diskStorage({
+    destination: (req, file, cb) => { cb(null, 'documents/'); },
+    filename: (req, file, cb) => {
+        cb(null, Date.now() + '-' + file.originalname);
+    }
+});
+const upload = multer({ storage: storage });
+
+// Fields a maker is allowed to create/edit. Used both to build the "pending_data"
+// snapshot on an edit, and to apply that snapshot to the real columns on approval.
+const EDITABLE_FIELDS = [
+    'type', 'full_name', 'gender', 'dob', 'nationality', 'occupation',
+    'id_type', 'id_number', 'tin', 'phone', 'alt_phone', 'email',
+    'address_region', 'address_city', 'address_subcity', 'address_woreda', 'kebele', 'postal_address', 'emergency_contact',
+    'business_reg_no', 'license_info', 'auth_rep_details', 'contact_person',
+    'bank_account', 'no_of_share', 'no_of_share_birr', 'paidup_share', 'paidup_birr',
+    'payment_method', 'payment_status', 'subscription_ref_no',
+    'id_doc_path', 'agreement_doc_path', 'payment_doc_path'
+];
+
+const generateSequence = async (type, branchName) => {
+    const year = new Date().getFullYear().toString();
+    
+    // FETCH CODE FROM DB (Requirement 5.4 - Dynamic)
+    const [branchRes] = await db.promise().execute(
+        "SELECT branch_code FROM branches WHERE branch_name = ?", 
+        [branchName]
+    );
+    const branchCode = branchRes[0]?.branch_code || 'HO'; 
+    
+    const prefixes = { 'SHAREHOLDER': 'RB-SH', 'ALLOTMENT': 'ALOT', 'CERTIFICATE': 'CERT' };
+    const prefix = prefixes[type];
+
+    return new Promise((resolve, reject) => {
+        const sql = `INSERT INTO sequence_tracker (doc_type, branch_code, financial_year, next_sequence) 
+                     VALUES (?, ?, ?, 1) 
+                     ON DUPLICATE KEY UPDATE next_sequence = LAST_INSERT_ID(next_sequence + 1)`;
+        
+        db.query(sql, [type, branchCode, year], (err) => {
+            db.query("SELECT LAST_INSERT_ID() as seq", (err, rows) => {
+                const seq = rows[0].seq;
+                const paddedSeq = String(seq).padStart(5, '0');
+                resolve(`${prefix}/${year}/${branchCode}/${paddedSeq}`);
+            });
+        });
+    });
+};
+// Builds the "proposed values" object from a request body + uploaded files.
+// existing is the current DB row (used to keep old doc paths if no new file was sent).
+function buildProposedData(d, files, existing = {}) {
+    return {
+        type: d.type,
+        full_name: d.full_name,
+        gender: d.type === 'Institutional' ? null : d.gender,
+        dob: d.dob || null,
+        nationality: d.nationality,
+        occupation: d.occupation,
+        id_type: d.id_type,
+        id_number: d.id_number,
+        tin: d.tin,
+        phone: d.phone,
+        alt_phone: d.alt_phone,
+        email: d.email,
+        address_region: d.address_region,
+        address_city: d.address_city,
+        address_subcity: d.address_subcity,
+        address_woreda: d.address_woreda,
+        kebele: d.kebele,
+        postal_address: d.postal_address,
+        emergency_contact: d.emergency_contact,
+        business_reg_no: d.business_reg_no,
+        license_info: d.license_info,
+        auth_rep_details: d.auth_rep_details,
+        contact_person: d.contact_person,
+        bank_account: d.bank_account,
+        no_of_share: parseInt(d.no_of_share) || 0,
+        no_of_share_birr: parseFloat(d.no_of_share_birr) || 0,
+        paidup_share: parseInt(d.paidup_share) || 0,
+        paidup_birr: parseFloat(d.paidup_birr) || 0,
+        payment_method: d.payment_method || 'Bank Transfer',
+        payment_status: d.payment_status || 'Unpaid',
+        subscription_ref_no: d.subscription_ref_no,
+        id_doc_path: (files && files['id_doc']) ? files['id_doc'][0].filename : (d.id_doc_path || existing.id_doc_path || null),
+        agreement_doc_path: (files && files['agreement_doc']) ? files['agreement_doc'][0].filename : (d.agreement_doc_path || existing.agreement_doc_path || null),
+        payment_doc_path: (files && files['payment_doc']) ? files['payment_doc'][0].filename : (d.payment_doc_path || existing.payment_doc_path || null),
+    };
+}
+
+// 2. LOGIN WITH LOGGING
+app.post('/api/login', (req, res) => {
+    const { email, password } = req.body;
+    const query = "SELECT * FROM users WHERE email = ? AND password = ? AND is_active = 1";
+    
+    db.execute(query, [email, password], (err, results) => {
+        if (results.length > 0) {
+            const user = results[0];
+            
+            // --- NEW: FETCH THE ACTUAL PERMISSIONS FOR THIS ROLE ---
+            const permQuery = "SELECT permission_key FROM role_permissions WHERE role_name = ?";
+            db.execute(permQuery, [user.role], (err, perms) => {
+                const permissionList = perms.map(p => p.permission_key);
+                const token = jwt.sign({ id: user.id, email: user.email }, SECRET_KEY);
+                
+                res.json({ 
+                    success: true, 
+                    token, 
+                    name: user.name, 
+                    role: user.role,
+                    permissions: permissionList, // <--- SEND TO FRONTEND
+                    mustUpdatePassword: user.mustUpdatePassword 
+                });
+            });
+        } else {
+            res.status(401).json({ success: false, message: "Unauthorized" });
+        }
+    });
+});
+
+app.post('/api/update-password-status', (req, res) => {
+    const { email } = req.body;
+    db.execute("UPDATE users SET mustUpdatePassword = 0 WHERE email = ?", [email], (err) => {
+        if (err) return res.status(500).json(err);
+        res.json({ success: true });
+    });
+});
+
+// 3. GET SHAREHOLDERS (Fixed for Frontend expectations)
+app.get('/api/shareholders', (req, res) => {
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 10;
+    const search = req.query.search || '';
+    const statusFilter = req.query.status || ''; // Optional status filter
+    const offset = (page - 1) * limit;
+
+    const searchPattern = `%${search}%`;
+
+    // Advanced Query: Search through Name, ID, Phone, TIN, ID Number, and Certificate
+    let whereClause = `(full_name LIKE ? OR shareholder_id LIKE ? OR phone LIKE ? OR tin LIKE ? OR id_number LIKE ?)`;
+    let queryParams = [searchPattern, searchPattern, searchPattern, searchPattern, searchPattern];
+
+    // If a specific status is requested (e.g. only Active)
+    if (statusFilter) {
+        whereClause += ` AND status = ?`;
+        queryParams.push(statusFilter);
+    }
+
+    const countQuery = `SELECT COUNT(*) as total FROM shareholders WHERE ${whereClause}`;
+    
+    db.query(countQuery, queryParams, (err, countRes) => {
+        if (err) return res.status(500).json(err);
+        const totalRecords = countRes[0].total;
+        
+const dataQuery = `
+            SELECT s.*, u.name as introducer_name, 
+            (s.no_of_share_birr - s.paidup_birr) as outstanding_birr 
+            FROM shareholders s
+            LEFT JOIN users u ON s.introduced_by = u.id 
+            WHERE ${whereClause} 
+            ORDER BY s.id DESC LIMIT ? OFFSET ?`;
+
+            const dataParams = [...queryParams, limit, offset];
+
+        db.execute(dataQuery, dataParams, (err, results) => {
+            if (err) {
+                console.error("SQL Error:", err);
+                return res.status(500).json(err);
+            }
+            res.json({ 
+                data: results, 
+                pagination: { 
+                    totalRecords, 
+                    totalPages: Math.ceil(totalRecords / limit), 
+                    currentPage: page 
+                }
+            });
+        });
+    });
+});
+
+app.post('/api/shareholders', upload.fields([
+    { name: 'id_doc', maxCount: 1 },
+    { name: 'agreement_doc', maxCount: 1 },
+    { name: 'payment_doc', maxCount: 1 }
+]), async (req, res) => {
+    const d = req.body;
+    const files = req.files;
+    const user = d.performed_by || 'Unknown System User';
+    const classId = d.share_class_id || 1;
+
+        // MANDATORY BACKEND CHECK
+    const required = ['phone', 'bank_account', 'no_of_share'];
+    for (let field of required) {
+        if (!d[field]) {
+            return res.status(400).json({ error: `Critical field missing: ${field}` });
+        }
+    }
+
+    // Name check for Individuals
+    if (d.type === 'Individual' && (!d.first_name || !d.father_name || !d.grand_father_name)) {
+        return res.status(400).json({ error: "First, Father, and Grandfather names are required for individuals." });
+    }
+
+    try {
+        // --- 1. NBE CUTOFF LOGIC ---
+        const cutoffDate = new Date('2025-11-24');
+        const regDate = d.registration_date ? new Date(d.registration_date) : new Date();
+        
+        let initialStatus = 'Pending';
+        let phase = 'Pre-Cutoff';
+
+        if (regDate >= cutoffDate) {
+            initialStatus = 'Pending NBE Approval';
+            phase = 'Post-Nov-24';
+            console.log("⚠️ Post-cutoff detected. Staging member:", d.full_name);
+        }
+
+        // --- 2. FETCH METADATA ---
+        const [metaRes] = await db.promise().execute(`
+            SELECT par_value, issue_price,
+                (SELECT IFNULL(SUM(authorized_capital), 0) FROM capital_history WHERE share_class_id = ?) as limit_amt,
+                (SELECT IFNULL(SUM(no_of_share_birr), 0) FROM shareholders WHERE share_class_id = ? AND status != 'Rejected') as current_issued
+            FROM share_classes WHERE id = ?
+        `, [classId, classId, classId]);
+
+        if (!metaRes[0]) return res.status(404).json({ message: "Share class not found" });
+        const { par_value, issue_price, limit_amt, current_issued } = metaRes[0];
+        
+        // --- 3. MATH ---
+        const sharesRequested = parseInt(d.no_of_share) || 0;
+        const paidupShares = parseInt(d.paidup_share) || 0;
+        const calculatedSubscribedBirr = sharesRequested * parseFloat(issue_price);
+        const calculatedPaidupBirr = paidupShares * parseFloat(par_value);
+        const calculatedPremium = Math.max(0, parseFloat(d.paidup_birr || 0) - calculatedPaidupBirr);
+        const serviceCharge = parseFloat(d.service_charge_amt) || 0;
+
+        // --- 4. CAPITAL LIMIT CHECK ---
+        if (limit_amt > 0 && (parseFloat(current_issued) + calculatedSubscribedBirr) > parseFloat(limit_amt)) {
+            const remaining = limit_amt - current_issued;
+            return res.status(400).json({ 
+                success: false, 
+                message: `Issuance Blocked: Limit exceeded. Available: ${Number(remaining).toLocaleString()} ETB.` 
+            });
+        }
+
+        // --- 5. DUPLICATE CHECK ---
+const [dupResults] = await db.promise().execute(
+    `SELECT full_name FROM shareholders 
+     WHERE id_number = ? 
+     OR (national_id_no = ? AND national_id_no != '') 
+     OR (tin = ? AND tin != '') 
+     OR email = ?`,
+    [d.id_number, d.national_id_no || '', d.tin || '', d.email]
+);
+        if (dupResults.length > 0) {
+            const match = dupResults[0];
+            return res.status(400).json({ success: false, message: `DUPLICATE: ID/Email belongs to ${match.full_name}.` });
+        }
+
+        // --- 6. GENERATE ID ---
+        const shareholder_id = await generateSequence('SHAREHOLDER', d.branch_name);
+
+        // --- 7. FINAL INSERT (45 Columns matched with 45 Values) ---
+        const query = `INSERT INTO shareholders 
+        (shareholder_id, first_name, father_name, grand_father_name, full_name, gender, dob, nationality, occupation, id_type, id_number, national_id_no, tin, phone, alt_phone, email, address_region, address_city, address_subcity, address_woreda, kebele, postal_address, emergency_contact, business_reg_no, license_info, auth_rep_details, contact_person, bank_name, bank_account, branch_name, introduced_by, introducer_name_manual, no_of_share, no_of_share_birr, paidup_share, paidup_birr, paidup_premium, service_charge_amt, payment_method, payment_status, subscription_ref_no, id_doc_path, agreement_doc_path, payment_doc_path, created_by, status, registration_phase, action_type) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+
+        // Logic for Hybrid Introducer
+        const isManual = String(d.is_manual_introducer) === 'true' || d.is_manual_introducer === 1;
+
+        const values = [
+            shareholder_id, d.first_name, d.father_name, d.grand_father_name, d.full_name, d.type === 'Institutional' ? null : d.gender, d.dob || null, d.nationality, d.occupation, 
+            d.id_type, d.id_number, d.national_id_no, d.tin, d.phone, d.alt_phone, d.email, d.address_region, d.address_city, d.address_subcity, d.address_woreda, d.kebele, d.postal_address, d.emergency_contact, 
+            d.business_reg_no, d.license_info, d.auth_rep_details, d.contact_person, 'Rammis Bank', d.bank_account, d.branch_name || 'Main Branch',
+            isManual ? null : (d.introduced_by || null),
+            isManual ? d.introducer_name_manual : null,
+            sharesRequested, calculatedSubscribedBirr, paidupShares, calculatedPaidupBirr, calculatedPremium, serviceCharge,
+            d.payment_method || 'Bank Transfer', d.payment_status || 'Unpaid', d.subscription_ref_no,
+            files['id_doc'] ? files['id_doc'][0].filename : (d.id_doc_path || null),
+            files['agreement_doc'] ? files['agreement_doc'][0].filename : (d.agreement_doc_path || null),
+            files['payment_doc'] ? files['payment_doc'][0].filename : (d.payment_doc_path || null),
+            user, 
+            initialStatus, // 43. Status
+            phase,         // 44. Registration Phase
+            'CREATE'       // 45. Action Type
+        ];
+
+        await db.promise().execute(query, values);
+        logAction(shareholder_id, 'CREATE', user, { name: d.full_name, phase: phase, fee: serviceCharge });
+        
+        // Inside app.post('/api/shareholders' ... after the INSERT query successful:
+
+const welcomeMsg = `Dear ${d.full_name}, Welcome to Rammis Bank S.C. Your Shareholder ID is ${shareholder_id}. Thank you for investing with us.`;
+sendSMS(d.phone, welcomeMsg);
+
+        res.json({ success: true, status: initialStatus });
+
+    } catch (err) {
+        console.error("❌ SQL Error Details:", err);
+        res.status(500).json({ error: "System Error during registration. Check Column Count." });
+    }
+});
+
+
+// 6. APPROVE SHAREHOLDER (Checker Action) — handles both new registrations and edits
+app.put('/api/shareholders/:id/approve', async (req, res) => { 
+    const id = req.params.id;
+    const user = req.body.performed_by || 'Unknown Approver';
+
+    db.execute("SELECT status, action_type, pending_data, shareholder_id, full_name FROM shareholders WHERE id = ?", [id], async (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        if (rows.length === 0) return res.status(404).json({ success: false, message: "Not found" });
+        const row = rows[0];
+
+        if (row.action_type === 'CREATE') {
+            
+            // --- COMMISSION LOGIC (This is where your line 432 error was) ---
+            const [[shData]] = await db.promise().execute(
+                "SELECT is_agent_sale, agent_id, agent_commission_amt FROM shareholders WHERE id = ?", [id]
+            );
+
+            if (shData.is_agent_sale === 1 && shData.agent_id) {
+                await db.promise().execute(
+                    "UPDATE sales_agents SET current_balance = current_balance + ? WHERE id = ?",
+                    [shData.agent_commission_amt, shData.agent_id]
+                );
+            }
+            // --- END COMMISSION LOGIC ---
+
+            const certNo = "CERT-" + new Date().getFullYear() + "-" + Math.floor(1000 + Math.random() * 9000);
+            const query = "UPDATE shareholders SET status = 'Active', certificate_no = ?, action_type = NULL, approved_by = ?, updated_at = NOW() WHERE id = ?";
+            
+            db.execute(query, [certNo, user, id], (err) => {
+                logAction(row.shareholder_id, 'APPROVE', user, { cert: certNo });
+                res.json({ success: true });
+            });
+        
+} else if (row.action_type === 'EDIT') {
+            // Edit: Apply pending_data and record who approved the change
+            let pending = typeof row.pending_data === 'string' ? JSON.parse(row.pending_data) : row.pending_data;
+            
+            const setSql = EDITABLE_FIELDS.map(f => `${f} = ?`).join(', ');
+            const values = EDITABLE_FIELDS.map(f => pending[f]);
+            
+            // Add approved_by and ID to the end of values array
+            values.push(user); // for approved_by
+            values.push(id);   // for WHERE clause
+
+            const query = `UPDATE shareholders SET ${setSql}, status = 'Active', action_type = NULL, pending_data = NULL, approved_by = ?, updated_at = NOW() WHERE id = ?`;
+            
+            db.execute(query, values, (err) => {
+                logAction(row.shareholder_id, 'APPROVE', user, { info: "Edits Approved" });
+                res.json({ success: true });
+            });
+        }
+    });
+});
+
+// 6b. REJECT SHAREHOLDER (Checker Action) — handles both new registrations and edits
+app.put('/api/shareholders/:id/reject', (req, res) => {
+    const id = req.params.id;
+    const reason = (req.body && req.body.reason) ? req.body.reason : 'No reason provided';
+
+    db.execute("SELECT status, action_type, previous_status FROM shareholders WHERE id = ?", [id], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        if (rows.length === 0) return res.status(404).json({ success: false, message: "Shareholder not found" });
+        const row = rows[0];
+
+        if (row.status !== 'Pending' || !row.action_type) {
+            return res.status(400).json({ success: false, message: "Nothing pending approval for this record." });
+        }
+
+        if (row.action_type === 'CREATE') {
+            db.execute(
+                "UPDATE shareholders SET status = 'Rejected', action_type = NULL, rejection_reason = ? WHERE id = ?",
+                [reason, id],
+                (err) => {
+                    if (err) return res.status(500).json(err);
+                    res.json({ success: true, message: "New registration rejected." });
+                }
+            );
+            return;
+        }
+
+        // action_type === 'EDIT' -> discard proposed changes, restore the previous approved status
+        db.execute(
+            "UPDATE shareholders SET status = ?, action_type = NULL, pending_data = NULL, previous_status = NULL, rejection_reason = ? WHERE id = ?",
+            [row.previous_status || 'Active', reason, id],
+            (err) => {
+                if (err) return res.status(500).json(err);
+                res.json({ success: true, message: "Edits rejected. Original record kept." });
+            }
+        );
+    });
+});
+
+// 8. DELETE SHAREHOLDER
+app.delete('/api/shareholders/:id', (req, res) => {
+    db.execute("DELETE FROM shareholders WHERE id = ?", [req.params.id], (err) => {
+        if (err) return res.status(500).json(err);
+        res.json({ success: true });
+    });
+});
+
+// 9. DASHBOARD STATS SUMMARY
+app.get('/api/stats/summary', (req, res) => {
+    const queries = {
+        // COALESCE(..., 0) ensures we never send null to the frontend
+        registry: `SELECT 
+    COUNT(*) as total, 
+    IFNULL(SUM(CASE WHEN status = 'Pending' THEN 1 ELSE 0 END), 0) as pending_sh,
+    IFNULL(SUM(CASE WHEN type = 'Individual' THEN 1 ELSE 0 END), 0) as individual_count,
+    IFNULL(SUM(CASE WHEN type = 'Institutional' THEN 1 ELSE 0 END), 0) as institutional_count
+    FROM shareholders WHERE status != 'Rejected'`,
+
+        capital: `SELECT 
+            IFNULL((SELECT authorized_capital FROM capital_history ORDER BY id DESC LIMIT 1), 0) as authorized,
+            IFNULL(SUM(no_of_share_birr), 0) as subscribed,
+            IFNULL(SUM(paidup_birr), 0) as paidup
+            FROM shareholders WHERE status = 'Active'`,
+
+        operations: `SELECT 
+            (SELECT COUNT(*) FROM certificates WHERE status = 'Active') as active_certs,
+            (SELECT COUNT(*) FROM share_transfers WHERE status = 'Pending') as pending_transfers`,
+
+        activities: `SELECT full_name, action_type, status, registration_date as date 
+            FROM shareholders ORDER BY id DESC LIMIT 5`
+    };
+
+    const results = {};
+    const keys = Object.keys(queries);
+    let completed = 0;
+
+    keys.forEach(key => {
+        db.query(queries[key], (err, data) => {
+            if (err) {
+                console.error(`Query error in ${key}:`, err);
+                results[key] = []; // Fallback to empty array
+            } else {
+                results[key] = data;
+            }
+            completed++;
+            if (completed === keys.length) res.json(results);
+        });
+    });
+});
+
+// Helper for Excel dates
+const formatExcelDate = (dateStr) => {
+    if (!dateStr || dateStr === 'NULL') return null;
+    const parts = dateStr.split('/');
+    if (parts.length === 3) {
+        const month = parts[0].padStart(2, '0');
+        const day = parts[1].padStart(2, '0');
+        const year = parts[2];
+        return `${year}-${month}-${day}`;
+    }
+    return dateStr;
+};
+
+// 10. BULK IMPORT CSV
+app.post('/api/shareholders/import', upload.single('file'), (req, res) => {
+    const results = [];
+    const filePath = req.file.path;
+
+    fs.createReadStream(filePath)
+        .pipe(csv())
+        .on('data', (data) => results.push(data))
+        .on('end', () => {
+            // 1. Updated Query with ALL columns (31 columns total)
+            const query = `INSERT INTO shareholders 
+            (shareholder_id, type, full_name, gender, dob, nationality, occupation, 
+             id_type, id_number, tin, phone, alt_phone, email, 
+             address_region, address_city, address_subcity, address_woreda, kebele, postal_address, emergency_contact, 
+             business_reg_no, license_info, auth_rep_details, contact_person, 
+             bank_name, bank_account, no_of_share, no_of_share_birr, paidup_share, paidup_birr, 
+             payment_method, payment_status, status) 
+            VALUES ?`;
+
+            const values = results.map(sh => [
+                "RB-SH-" + Math.floor(100000 + Math.random() * 900000),
+                sh.type || 'Individual',
+                sh.full_name,
+                sh.type === 'Institutional' ? null : (sh.gender || 'Male'),
+                formatExcelDate(sh.dob),
+                sh.nationality || 'Ethiopian',
+                sh.occupation || null,
+                sh.id_type || 'National ID',
+                sh.id_number,
+                sh.tin || null,
+                sh.phone,
+                sh.alt_phone || null,
+                sh.email || null,
+                sh.address_region || null,
+                sh.address_city || null,
+                sh.address_subcity || null,
+                sh.address_woreda || null,
+                sh.kebele || null,
+                sh.postal_address || null,
+                sh.emergency_contact || null,
+                sh.business_reg_no || null,
+                sh.license_info || null,
+                sh.auth_rep_details || null,
+                sh.contact_person || null,
+                'Rammis Bank',
+                sh.bank_account || null,
+                parseInt(sh.no_of_share) || 0,
+                parseFloat(sh.no_of_share_birr) || 0,
+                parseInt(sh.paidup_share) || 0,
+                parseFloat(sh.paidup_birr) || 0,
+                sh.payment_method || 'Bank Transfer',
+                sh.payment_status || 'Full', // Default existing data to Full usually
+                'Active' // Bulk imported legacy data is usually active immediately
+            ]);
+
+            db.query(query, [values], (err, result) => {
+                if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+                if (err) {
+                    console.error("Bulk Import Error:", err);
+                    return res.status(500).json({ error: err.sqlMessage });
+                }
+                res.json({ success: true, count: result.affectedRows });
+            });
+        });
+});
+
+app.get('/api/reports/shareholder-stats', (req, res) => {
+    const queries = {
+        summary: "SELECT type, status, COUNT(*) as count FROM shareholders GROUP BY type, status",
+        regions: "SELECT address_region, COUNT(*) as count FROM shareholders GROUP BY address_region",
+        trends: "SELECT DATE_FORMAT(registration_date, '%M %Y') as month, COUNT(*) as count FROM shareholders GROUP BY month ORDER BY registration_date DESC LIMIT 6",
+        kyc: "SELECT CASE WHEN id_doc_path IS NOT NULL THEN 'Verified' ELSE 'Pending' END as kyc_status, COUNT(*) as count FROM shareholders GROUP BY kyc_status"
+    };
+
+    const results = {};
+    const keys = Object.keys(queries);
+    let completed = 0;
+
+    keys.forEach(key => {
+        db.query(queries[key], (err, data) => {
+            results[key] = data;
+            completed++;
+            if (completed === keys.length) res.json(results);
+        });
+    });
+});
+
+// 1. Get Capital Summary (Authorized vs Paid-up)
+// --- UPDATED CAPITAL SUMMARY (Section 2.2.1 & 2.2.3 Consolidated) ---
+app.get('/api/capital/summary', (req, res) => {
+    const query = `
+        SELECT 
+            /* 1. GET THE LATEST APPROVED LIMIT (Fixes the NaN and 0 issue) */
+            IFNULL((SELECT authorized_capital FROM capital_history WHERE status = 'Approved' ORDER BY id DESC LIMIT 1), 0) as total_authorized,
+            
+            /* 2. KEEP EXISTING SUBSCRIBED TOTALS */
+            IFNULL(SUM(no_of_share_birr), 0) as total_subscribed,
+            
+            /* 3. KEEP EXISTING PAID-UP TOTALS */
+            IFNULL(SUM(paidup_birr), 0) as total_paidup,
+            
+            /* 4. KEEP EXISTING PREMIUM TOTALS (Requirement 6.4) */
+            IFNULL(SUM(paidup_premium), 0) as total_premium,
+            
+            /* 5. KEEP OUTSTANDING BALANCE MATH (Requirement 3.2) */
+            IFNULL(SUM(no_of_share_birr - paidup_birr), 0) as total_outstanding,
+            
+            /* 6. KEEP SUBSCRIPTION MONITORING COUNTS (Requirement 3.4) */
+            COUNT(CASE WHEN subscription_status = 'Pending' THEN 1 END) as sub_pending,
+            COUNT(CASE WHEN subscription_status = 'Approved' THEN 1 END) as sub_approved,
+            COUNT(CASE WHEN subscription_status = 'Completed' THEN 1 END) as sub_completed
+
+        FROM shareholders 
+        WHERE status = 'Active'`;
+    
+    db.query(query, (err, results) => {
+        if (err) {
+            console.error("Capital Summary SQL Error:", err);
+            return res.status(500).json(err);
+        }
+        res.json(results[0]);
+    });
+});
+
+// 2. Get Share Classes
+app.get('/api/capital/classes', (req, res) => {
+    db.query("SELECT * FROM share_classes", (err, results) => {
+        if (err) return res.status(500).json(err);
+        res.json(results);
+    });
+});
+
+// 3. Update Authorized Capital (Board Resolution)
+// --- FIXED: INITIATE CAPITAL INCREASE (Maker Action) ---
+app.post('/api/capital/update', async (req, res) => {
+    const d = req.body;
+    const user = d.performed_by || 'Admin';
+
+    try {
+        // 1. Fetch current par value to calculate shares quantity (Requirement 1.2)
+        const [classRes] = await db.promise().execute(
+            "SELECT par_value FROM share_classes WHERE id = ?", 
+            [d.share_class_id]
+        );
+        
+        if (!classRes[0]) return res.status(404).json({ message: "Share class not found" });
+        
+        const parValue = parseFloat(classRes[0].par_value);
+        const amount = parseFloat(d.amount);
+        const calcShares = Math.floor(amount / parValue); // Calculate max number of shares
+
+        // 2. Insert as a 'Pending' record for the Checker to approve
+        const query = `INSERT INTO capital_history 
+            (event_type, share_class_id, authorized_capital, authorized_shares, 
+             board_resolution_no, shareholder_resolution_no, effective_date, 
+             performed_by, status) 
+            VALUES ('INCREASE', ?, ?, ?, ?, ?, ?, ?, 'Pending')`;
+        
+        const values = [
+            d.share_class_id, 
+            amount, 
+            calcShares, 
+            d.board_res, 
+            d.sh_res, 
+            d.date, 
+            user
+        ];
+
+        db.execute(query, values, (err) => {
+            if (err) {
+                console.error("SQL Error in Capital Update:", err);
+                return res.status(500).json({ error: err.message });
+            }
+            
+            // Log the proposal in audit trail
+            logAction('CAPITAL', 'CREATE', user, { event: 'Capital Increase Proposed', amount: amount });
+            
+            res.json({ success: true, message: "Proposal submitted to Checker." });
+        });
+
+    } catch (error) {
+        console.error("Processing Error:", error);
+        res.status(500).json({ error: "Server failed to process request" });
+    }
+});
+
+// 3. APPROVE CAPITAL CHANGE (Checker - Section 2.2.1.5)
+// --- APPROVE CAPITAL CHANGE (Checker Action) ---
+app.put('/api/capital/history/:id/approve', (req, res) => {
+    const { id } = req.params;
+    const adminName = req.body.performed_by || 'Admin';
+
+    // Update the status to 'Approved'
+    const query = "UPDATE capital_history SET status = 'Approved', performed_by = ? WHERE id = ?";
+    
+    db.execute(query, [adminName, id], (err, result) => {
+        if (err) {
+            console.error(err);
+            return res.status(500).json({ success: false, error: err.message });
+        }
+        
+        // LOG the approval in the master audit trail
+        logAction('CAPITAL', 'APPROVE', adminName, { event: 'Capital Limit Authorized', id: id });
+        
+        res.json({ success: true, message: "Capital limit officially authorized." });
+    });
+});
+
+// --- 1. RECORD NEW PAYMENT (Maker or Admin) ---
+app.post('/api/payments', async (req, res) => {
+    const { sh_id, amount, date, ref, method, branch, user, bank_account } = req.body;
+    const paymentAmount = parseFloat(amount);
+
+    try {
+        // A. FETCH CONTEXT: User Role, Shareholder Info, and Bank Parameters
+        // 1. Check if performer is Admin
+        const [userRows] = await db.promise().execute("SELECT role FROM users WHERE name = ? OR email = ?", [user, user]);
+        const userRole = userRows[0]?.role || 'Maker';
+        const isAdmin = userRole === 'Admin';
+        
+        // 2. Check if this shareholder is an Agent Sale
+        const [[sh]] = await db.promise().execute("SELECT is_agent_sale, agent_id FROM shareholders WHERE id = ?", [sh_id]);
+        
+        // 3. Fetch Service Charge and Commission Rates from Parameters table
+        const [params] = await db.promise().execute("SELECT param_key, param_value FROM system_parameters");
+        const servicePct = parseFloat(params.find(p => p.param_key === 'service_charge_pct')?.param_value || 5);
+        const agentPct = parseFloat(params.find(p => p.param_key === 'agent_commission_pct')?.param_value || 2.5);
+
+        // B. CALCULATE FEES FOR THIS SPECIFIC RECEIPT
+        const calculatedServiceCharge = paymentAmount * (servicePct / 100);
+        const calculatedAgentComm = (sh.is_agent_sale === 1) ? (paymentAmount * (agentPct / 100)) : 0;
+
+        const initialStatus = isAdmin ? 'Approved' : 'Pending';
+
+        // C. INSERT DETAILED PAYMENT RECORD (The Ledger Entry)
+        const insertQuery = `INSERT INTO capital_payments 
+            (shareholder_id, amount_paid, payment_date, reference_no, payment_method, 
+             branch_name, bank_account_used, service_charge_collected, 
+             agent_commission_calculated, maker_id, checker_id, status, created_at) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())`;
+
+        const [insertResult] = await db.promise().execute(insertQuery, [
+            sh_id, paymentAmount, date, ref, method, branch, 
+            bank_account || 'Default Account', 
+            calculatedServiceCharge, 
+            calculatedAgentComm, 
+            user,
+            isAdmin ? user : null, 
+            initialStatus
+        ]);
+
+        // Inside app.post('/api/payments' ... after the INSERT successful:
+
+const payMsg = `Dear Customer, we have received your payment of ETB ${paymentAmount.toLocaleString()}. Ref: ${ref}. It is currently pending verification.`;
+sendSMS(sh.phone, payMsg);
+
+        // D. IF ADMIN: IMMEDIATELY POST TO LEDGERS (Auto-Approval Logic)
+        if (isAdmin) {
+            // 1. Update Shareholder Registry (Principal amount)
+            const updateSHQuery = `
+                UPDATE shareholders 
+                SET paidup_birr = paidup_birr + ?,
+                    paidup_share = FLOOR((paidup_birr + ?) / 1000),
+                    subscription_status = IF((paidup_birr + ?) >= no_of_share_birr, 'Completed', subscription_status)
+                WHERE id = ?`;
+            await db.promise().execute(updateSHQuery, [paymentAmount, paymentAmount, paymentAmount, sh_id]);
+
+            // 2. If Agent sale, update Agent's commission wallet immediately
+            if (sh.is_agent_sale === 1 && sh.agent_id) {
+                await db.promise().execute(
+                    "UPDATE sales_agents SET current_balance = current_balance + ? WHERE id = ?",
+                    [calculatedAgentComm, sh.agent_id]
+                );
+            }
+
+            logAction(sh_id, 'PAYMENT_DIRECT_POST', user, { 
+                amount: paymentAmount, 
+                ref, 
+                service_charge: calculatedServiceCharge,
+                agent_comm: calculatedAgentComm
+            });
+        } else {
+            // For Makers, we just log that the process has started
+            logAction(sh_id, 'PAYMENT_INITIATE', user, { amount: paymentAmount, ref, status: 'Pending Approval' });
+        }
+
+        // E. FINAL RESPONSE
+        res.json({ 
+            success: true, 
+            paymentId: insertResult.insertId,
+            autoApproved: isAdmin,
+            message: isAdmin 
+                ? "Payment and Fees approved. Ledger updated." 
+                : "Receipt recorded. Pending Checker authorization."
+        });
+
+    } catch (err) {
+        console.error("Payment Submission Error:", err);
+        // Handle Duplicate Reference Error (from the UNIQUE INDEX we added)
+        if (err.code === 'ER_DUP_ENTRY') {
+            return res.status(400).json({ error: "Duplicate Reference: This Bank Slip No. has already been used." });
+        }
+        res.status(500).json({ error: "Internal Server Error: " + err.message });
+    }
+});
+
+// 2. Approve Payment (Checker) - This automatically updates the Shareholder's total
+app.put('/api/payments/:id/approve', async (req, res) => {
+    const payId = req.params.id;
+    const checker = req.body.performed_by || 'Checker';
+
+    try {
+        const [payRes] = await db.promise().execute("SELECT * FROM capital_payments WHERE id = ?", [payId]);
+        const payment = payRes[0];
+
+        if (!payment) return res.status(404).json({ message: "Payment not found" });
+        if (payment.status === 'Approved') return res.status(400).json({ message: "Payment is already approved" });
+
+        const amountPaid = parseFloat(payment.amount_paid);
+        const shId = payment.shareholder_id;
+
+        // A. Increase Paid-up Birr, Recalculate Shares & Status
+        const updateSHQuery = `
+            UPDATE shareholders 
+            SET paidup_birr = paidup_birr + ?,
+                paidup_share = FLOOR((paidup_birr + ?) / 1000),
+                subscription_status = IF((paidup_birr + ?) >= no_of_share_birr, 'Completed', 'Approved')
+            WHERE id = ?`;
+
+        await db.promise().execute(updateSHQuery, [amountPaid, amountPaid, amountPaid, shId]);
+
+        // B. Mark Payment as Approved
+        await db.promise().execute(
+            "UPDATE capital_payments SET status = 'Approved', checker_id = ? WHERE id = ?", 
+            [checker, payId]
+        );
+
+        // C. Audit Log
+        logAction(shId, 'APPROVE_PAYMENT', checker, { amount: amountPaid, ref: payment.reference_no, event: 'Installment Payment Verified' });
+const approvedMsg = `Payment Verified: ETB ${amountPaid.toLocaleString()} has been successfully added to your share capital. Rammis Bank S.C.`;
+sendSMS(shInfo.phone, approvedMsg);
+        res.json({ success: true, message: "Payment authorized! Outstanding balance decreased." });
+
+    } catch (err) {
+        console.error("Payment Approval Error:", err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// 3. Paid-up Capital Report API (Section 2.2.4.4)
+app.get('/api/reports/paid-up', (req, res) => {
+    const query = `
+        SELECT branch_name, SUM(paidup_birr) as total_paid, COUNT(id) as member_count 
+        FROM shareholders 
+        WHERE status = 'Active' 
+        GROUP BY branch_name`;
+    
+    db.query(query, (err, results) => {
+        if (err) return res.status(500).json(err);
+        res.json(results);
+    });
+});
+
+// --- 4. CHECKER REJECT PAYMENT ---
+app.put('/api/payments/:id/reject', (req, res) => {
+    const payId = req.params.id;
+    const { reason, performed_by } = req.body;
+
+    const query = "UPDATE capital_payments SET status = 'Rejected', checker_id = ? WHERE id = ?";
+    db.execute(query, [performed_by, payId], (err) => {
+        if (err) return res.status(500).json(err);
+        res.json({ success: true, message: "Payment rejected." });
+    });
+});
+
+// 1. Update Share Class Rights (Section 2.2.5.2)
+// 1. UPDATE SHARE CLASS RIGHTS (Section 2.2.5.2)
+app.put('/api/capital/classes/:id/rights', async (req, res) => {
+    const { id } = req.params;
+    const d = req.body;
+    const user = d.performed_by || 'Admin';
+
+    // Fetch old data for history (Requirement 2.2.5.4)
+    db.query("SELECT * FROM share_classes WHERE id = ?", [id], async (err, results) => {
+        const oldData = results[0];
+
+        const query = `UPDATE share_classes SET 
+            voting_rights = ?, dividend_rights = ?, redemption_rights = ?, 
+            conversion_rights = ?, transfer_restrictions = ?, liquidation_priority = ?, 
+            version_no = version_no + 1 
+            WHERE id = ?`;
+
+        const values = [
+            d.voting_rights, d.dividend_rights, d.redemption_rights, 
+            d.conversion_rights, d.transfer_restrictions, d.liquidation_priority, id
+        ];
+
+        db.execute(query, values, (err) => {
+            if (err) return res.status(500).json(err);
+
+            // Log the change for Audit trail
+            const logQuery = "INSERT INTO share_class_history (share_class_id, change_summary, old_data, new_data, performed_by) VALUES (?, ?, ?, ?, ?)";
+            db.execute(logQuery, [id, 'Rights and Restrictions Updated', JSON.stringify(oldData), JSON.stringify(d), user]);
+
+            res.json({ success: true });
+        });
+    });
+});
+
+// 1. Get Certificate Register (Section 2.5.6)
+// --- UPDATED: PAGINATED CERTIFICATE REGISTER (Section 2.5) ---
+app.get('/api/certificates', (req, res) => {
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 10;
+    const search = req.query.search || '';
+    const status = req.query.status || '';
+    const offset = (page - 1) * limit;
+
+    const searchPattern = `%${search}%`;
+    let whereClause = `(c.certificate_no LIKE ? OR s.full_name LIKE ? OR s.shareholder_id LIKE ?)`;
+    let queryParams = [searchPattern, searchPattern, searchPattern];
+
+    if (status) {
+        whereClause += ` AND c.status = ?`;
+        queryParams.push(status);
+    }
+
+    const countQuery = `SELECT COUNT(*) as total FROM certificates c JOIN shareholders s ON c.shareholder_id = s.id WHERE ${whereClause}`;
+    
+    db.query(countQuery, queryParams, (err, countRes) => {
+        if (err) return res.status(500).json(err);
+        const totalRecords = countRes[0].total;
+
+        // Fetching all details needed for the bilingual department template
+const dataQuery = `
+    SELECT 
+        c.*, 
+        s.full_name, s.shareholder_id as sh_code, s.address_region, 
+        s.address_city, s.kebele, s.phone, s.paidup_birr,
+        sc.class_name,
+        -- Fetch Bank Static Legal Dates
+        (SELECT memo_auth_date_gc FROM bank_settings LIMIT 1) as memo_date_en,
+        (SELECT memo_auth_date_ec FROM bank_settings LIMIT 1) as memo_date_local,
+        (SELECT bank_reg_date_gc FROM bank_settings LIMIT 1) as bank_reg_date_en,
+        -- Capital Totals
+        (SELECT SUM(no_of_share_birr) FROM shareholders WHERE status='Active') as total_subscribed_bank,
+        (SELECT SUM(paidup_birr) FROM shareholders WHERE status='Active') as total_paidup_bank
+    FROM certificates c
+    JOIN shareholders s ON c.shareholder_id = s.id
+    LEFT JOIN share_classes sc ON c.share_class_id = sc.id
+    WHERE ${whereClause} 
+            ORDER BY c.id DESC LIMIT ? OFFSET ?`;
+
+        db.execute(dataQuery, [...queryParams, limit, offset], (err, results) => {
+            if (err) return res.status(500).json(err);
+            res.json({
+                data: results,
+                pagination: { totalRecords, totalPages: Math.ceil(totalRecords / limit), currentPage: page }
+            });
+        });
+    });
+});
+
+// 2. EXPORT CERTIFICATE REGISTER (Section 2.5.6)
+app.get('/api/certificates/export', (req, res) => {
+    const query = `
+        SELECT c.certificate_no, s.full_name, s.shareholder_id, c.shares_count, c.issue_date, c.status, c.print_count 
+        FROM certificates c 
+        JOIN shareholders s ON c.shareholder_id = s.id`;
+    
+    db.query(query, (err, results) => {
+        if (err) return res.status(500).json(err);
+        
+        // Convert JSON to CSV format
+        const csvHeader = "Certificate No,Shareholder Name,Member ID,Shares,Issue Date,Status,Prints\n";
+        const csvRows = results.map(r => 
+            `${r.certificate_no},${r.full_name},${r.shareholder_id},${r.shares_count},${r.issue_date},${r.status},${r.print_count}`
+        ).join("\n");
+        
+        res.setHeader('Content-Type', 'text/csv');
+        res.setHeader('Content-Disposition', 'attachment; filename=Certificate_Register.csv');
+        res.status(200).send(csvHeader + csvRows);
+    });
+});
+
+// 2. Manual Issuance (Section 2.5.1)
+app.post('/api/certificates/issue', (req, res) => {
+    const { shareholder_id, shares, class_id, date } = req.body;
+    const certNo = "CERT-" + Date.now().toString().slice(-6); // Simple unique number
+
+    const query = `INSERT INTO certificates (certificate_no, shareholder_id, shares_count, issue_date, share_class_id, status) 
+                   VALUES (?, ?, ?, ?, ?, 'Active')`;
+    
+    db.execute(query, [certNo, shareholder_id, shares, date, class_id], (err) => {
+        if (err) return res.status(500).json(err);
+        res.json({ success: true, certNo });
+    });
+});
+
+// ISSUE CERTIFICATE API (Section 2.5.1)
+app.post('/api/certificates/generate', async (req, res) => {
+    const { shareholder_id, user } = req.body;
+
+    try {
+        // 1. Get shareholder info including their assigned share class
+        const [sh] = await db.promise().execute(
+            "SELECT branch_name, no_of_share, share_class_id FROM shareholders WHERE id = ?", 
+            [shareholder_id]
+        );
+
+        if (!sh[0]) return res.status(404).json({ message: "Shareholder not found" });
+
+        // 2. Calculate Serial Ranges (Numbered From -> Numbered To)
+        const [[lastCert]] = await db.promise().execute(
+            "SELECT MAX(numbered_to) as last_val FROM certificates WHERE share_class_id = ?", 
+            [sh[0].share_class_id]
+        );
+        
+        const startNo = (lastCert.last_val || 0) + 1;
+        const endNo = startNo + (sh[0].no_of_share - 1);
+
+        // 3. Generate sequential Certificate Reference Number
+        const certNo = await generateSequence('CERTIFICATE', sh[0].branch_name);
+
+        // 4. INSERT with all required fields for the new template
+        const query = `INSERT INTO certificates 
+            (certificate_no, shareholder_id, shares_count, share_class_id, issue_date, status, numbered_from, numbered_to, created_by) 
+            VALUES (?, ?, ?, ?, NOW(), 'Active', ?, ?, ?)`;
+
+        await db.promise().execute(query, [
+            certNo, 
+            shareholder_id, 
+            sh[0].no_of_share, 
+            sh[0].share_class_id || 1, // Default to class 1 if null
+            startNo, 
+            endNo, 
+            user
+        ]);
+
+        // 5. Log the action
+        logAction(shareholder_id, 'ISSUE_CERT', user, { cert_no: certNo, range: `${startNo}-${endNo}` });
+
+        res.json({ success: true, certificate_no: certNo });
+
+    } catch (err) {
+        console.error("Issuance Error:", err);
+        res.status(500).json({ message: "Internal Server Error during issuance" });
+    }
+});
+
+// LOG PRINT EVENT (Section 2.5.2.5)
+app.post('/api/certificates/:id/log-print', (req, res) => {
+    const { id } = req.params;
+    const user = req.body.user || 'Unknown User'; // Fix: Get user from body
+
+    // 1. Fetch certificate details first to get the shareholder link
+    db.query("SELECT certificate_no, shareholder_id FROM certificates WHERE id = ?", [id], (err, results) => {
+        if (err || !results[0]) {
+            console.error("Print Log Error: Certificate not found");
+            return res.status(404).json({ error: "Certificate not found" });
+        }
+
+        const cert = results[0];
+        const query = `UPDATE certificates 
+                       SET print_status = 'Printed', 
+                           last_printed_at = NOW(), 
+                           print_count = print_count + 1 
+                       WHERE id = ?`;
+        
+        // 2. Update the print count
+        db.execute(query, [id], (err) => {
+            if (err) {
+                console.error("SQL Error updating print count:", err);
+                return res.status(500).json({ error: err.message });
+            }
+
+            // 3. Log to the master Audit Trail
+            logAction(cert.shareholder_id, 'UPDATE', user, { 
+                event: 'Certificate Viewed/Printed', 
+                cert_no: cert.certificate_no 
+            });
+
+            res.json({ success: true });
+        });
+    });
+});
+
+// Get version history for a certificate (Section 2.5.3.4)
+app.get('/api/certificates/:id/history', (req, res) => {
+    const query = "SELECT * FROM certificate_versions WHERE certificate_id = ? ORDER BY version_no DESC";
+    db.execute(query, [req.params.id], (err, results) => {
+        if (err) return res.status(500).json(err);
+        res.json(results);
+    });
+});
+
+app.get('/api/verify/:certNo', (req, res) => {
+    const query = `SELECT c.*, s.full_name FROM certificates c JOIN shareholders s ON c.shareholder_id = s.id WHERE c.certificate_no = ?`;
+    db.execute(query, [req.params.certNo], (err, results) => {
+        if (results.length > 0) {
+            // Log that someone verified this certificate via QR
+            logAction(results[0].shareholder_id, 'UPDATE', 'Public/QR Scanner', { 
+                event: 'Certificate Verified via QR', 
+                cert_no: req.params.certNo 
+            });
+            res.json(results[0]);
+        } else {
+            res.status(404).json({ message: "Invalid" });
+        }
+    });
+});
+
+// 1. RE-ISSUE REQUEST (Maker) - Section 2.5.4.1 & 2.5.4.2
+// --- 5. RE-ISSUE REQUEST (Maker Action) ---
+app.post('/api/certificates/re-issue-request', upload.fields([
+    { name: 'police_report', maxCount: 1 },
+    { name: 'indemnity_form', maxCount: 1 }
+]), async (req, res) => {
+    const d = req.body;
+    const files = req.files;
+    const user = d.performed_by || 'Admin';
+
+    try {
+        // 1. Generate new sequential number for the replacement
+        // Using the sequence engine we built earlier
+        const [shInfo] = await db.promise().execute("SELECT branch_name FROM shareholders WHERE id = ?", [d.shareholder_id]);
+        const newCertNo = await generateSequence('CERTIFICATE', shInfo[0].branch_name);
+
+        // 2. Prepare SQL for all columns
+        const query = `INSERT INTO certificates 
+            (certificate_no, shareholder_id, shares_count, issue_date, status, action_type, re_issued_from, re_issue_reason, police_report_path, indemnity_form_path) 
+            VALUES (?, ?, ?, NOW(), 'Pending', 'RE_ISSUE', ?, ?, ?, ?)`;
+
+        const values = [
+            newCertNo,
+            d.shareholder_id,
+            d.shares_count,
+            d.old_cert_id,
+            d.reason,
+            files['police_report'] ? files['police_report'][0].filename : null,
+            files['indemnity_form'] ? files['indemnity_form'][0].filename : null
+        ];
+
+        db.execute(query, values, (err) => {
+            if (err) {
+                console.error("SQL Error:", err);
+                return res.status(500).json({ message: "Database Error", details: err.message });
+            }
+            
+            // 3. Log to Audit Trail
+            logAction(d.shareholder_id, 'CREATE', user, { event: 'Replacement Requested', old_id: d.old_cert_id, new_no: newCertNo });
+            
+            res.json({ success: true });
+        });
+    } catch (e) {
+        res.status(500).json({ message: "Processing Failed", error: e.message });
+    }
+});
+
+// --- 6. CORRECTED APPROVE REPLACEMENT (Checker Action) ---
+app.put('/api/certificates/:id/approve-replacement', (req, res) => {
+    const newCertId = req.params.id;
+    const user = req.body.performed_by || 'Admin';
+
+    // 1. Fetch the relationship to find the old certificate
+    db.execute("SELECT re_issued_from, shareholder_id FROM certificates WHERE id = ?", [newCertId], (err, results) => {
+        if (err || !results[0]) return res.status(404).json({ message: "Record not found" });
+        
+        const oldCertId = results[0].re_issued_from;
+        const shId = results[0].shareholder_id;
+
+        // Step A: Cancel the original certificate
+        db.execute("UPDATE certificates SET status = 'Cancelled' WHERE id = ?", [oldCertId], (err) => {
+            
+            // Step B: ACTIVATE the new certificate (FIXED: Table name changed from shareholders to certificates)
+            const activateQuery = "UPDATE certificates SET status = 'Active', approved_by = ? WHERE id = ?";
+            
+            db.execute(activateQuery, [user, newCertId], (err) => {
+                if (err) return res.status(500).json({ error: err.message });
+
+                // Step C: Log the event
+                logAction(shId, 'APPROVE', user, { event: 'Replacement Certificate Activated', id: newCertId });
+
+                res.json({ success: true, message: "Authorized Successfully" });
+            });
+        });
+    });
+});
+
+app.put('/api/certificates/:id/reject-replacement', (req, res) => {
+    const id = req.params.id;
+    const user = req.body.performed_by;
+    const reason = req.body.reason;
+
+    db.execute("SELECT * FROM certificates WHERE id = ?", [id], (err, results) => {
+        const cert = results[0];
+        db.execute("UPDATE certificates SET status = 'Rejected', rejection_reason = ? WHERE id = ?", [reason, id], (err) => {
+            
+            // LOG THE REJECTION
+            logAction(cert.shareholder_id, 'REJECT', user, { 
+                event: 'Replacement Request Rejected', 
+                cert_no: cert.certificate_no,
+                reason: reason 
+            });
+
+            res.json({ success: true });
+        });
+    });
+});
+
+// 1. REQUEST CANCELLATION (Maker) - Section 2.5.5.2
+app.put('/api/certificates/:id/request-cancel', (req, res) => {
+    const { id } = req.params;
+    const { reason, user } = req.body;
+
+    const query = `UPDATE certificates 
+                   SET status = 'Pending Cancellation', 
+                       cancellation_reason = ?, 
+                       cancelled_by = ? 
+                   WHERE id = ? AND status = 'Active'`;
+
+    db.execute(query, [reason, user, id], (err) => {
+        if (err) return res.status(500).json(err);
+        res.json({ success: true, message: "Cancellation request submitted." });
+    });
+});
+
+// 2. APPROVE CANCELLATION (Checker) - Section 2.5.5.4
+app.put('/api/certificates/:id/approve-cancel', (req, res) => {
+    const { id } = req.params;
+    const admin = req.body.performed_by;
+
+    const query = `UPDATE certificates 
+                   SET status = 'Cancelled', 
+                       cancelled_at = NOW(),
+                       approved_by = ?
+                   WHERE id = ?`;
+
+    db.execute(query, [admin, id], (err) => {
+        if (err) return res.status(500).json(err);
+        res.json({ success: true, message: "Certificate officially cancelled." });
+    });
+});
+
+app.get('/api/certificates/:certNo/audit', (req, res) => {
+    const certNo = req.params.certNo;
+    // We look for the certificate number inside the JSON string in the 'details' column
+    const query = `
+        SELECT * FROM audit_logs 
+        WHERE details LIKE ? 
+        ORDER BY created_at DESC`;
+        
+    db.execute(query, [`%${certNo}%`], (err, results) => {
+        if (err) return res.status(500).json(err);
+        res.json(results);
+    });
+});
+
+app.get('/api/reports/certificate-stats', (req, res) => {
+    const queries = {
+        // Summary counts (Requirement 9.1 - 9.4, 9.8)
+        summary: `
+            SELECT 
+                COUNT(*) as total,
+                SUM(CASE WHEN status = 'Active' THEN 1 ELSE 0 END) as active,
+                SUM(CASE WHEN status = 'Cancelled' THEN 1 ELSE 0 END) as cancelled,
+                SUM(CASE WHEN status = 'Pending' THEN 1 ELSE 0 END) as pending,
+                SUM(CASE WHEN is_electronic = 1 THEN 1 ELSE 0 END) as electronic
+            FROM certificates`,
+        
+        // Distribution by Share Class (Requirement 9.7)
+        by_class: `
+            SELECT sc.class_name, COUNT(c.id) as count 
+            FROM share_classes sc 
+            LEFT JOIN certificates c ON c.share_class_id = sc.id 
+            GROUP BY sc.class_name`,
+            
+        // Reasons for replacement (Requirement 9.4)
+        issues: `
+            SELECT re_issue_reason as reason, COUNT(*) as count 
+            FROM certificates 
+            WHERE action_type = 'RE_ISSUE' 
+            GROUP BY re_issue_reason`
+    };
+
+    const results = {};
+    const keys = Object.keys(queries);
+    let completed = 0;
+
+    keys.forEach(key => {
+        db.query(queries[key], (err, data) => {
+            results[key] = data;
+            completed++;
+            if (completed === keys.length) res.json(results);
+        });
+    });
+});
+
+// FULL SHAREHOLDER REGISTRY EXPORT (Requirement 12)
+app.get('/api/shareholders/export/full', (req, res) => {
+    const query = "SELECT shareholder_id, full_name, type, phone, email, status, no_of_share, paidup_birr, branch_name FROM shareholders";
+    
+    db.query(query, (err, results) => {
+        if (err) return res.status(500).json(err);
+        
+        const csvHeader = "ID,Full Name,Type,Phone,Email,Status,Shares,Paid ETB,Branch\n";
+        const csvRows = results.map(r => 
+            `"${r.shareholder_id}","${r.full_name}","${r.type}","${r.phone}","${r.email}","${r.status}",${r.no_of_share},${r.paidup_birr},"${r.branch_name}"`
+        ).join("\n");
+        
+        res.setHeader('Content-Type', 'text/csv');
+        res.setHeader('Content-Disposition', 'attachment; filename=Rammis_Full_Registry.csv');
+        res.status(200).send(csvHeader + csvRows);
+    });
+});
+
+
+// 2. APPROVE TRANSFER (Checker) - Section 2.4.7
+// --- MASTER FIXED APPROVAL ROUTE (Section 2.4.7) ---
+app.put('/api/transfers/:id/approve', async (req, res) => {
+    const { id } = req.params;
+    const admin = req.body.performed_by || 'Admin';
+
+    try {
+        // 1. Fetch Transfer details AND the official Par Value for the bank
+        const [meta] = await db.promise().execute(`
+            SELECT t.*, sc.par_value as official_par 
+            FROM share_transfers t 
+            JOIN share_classes sc ON sc.id = 1 
+            WHERE t.id = ?`, [id]);
+        
+        if (!meta[0]) return res.status(404).json({ message: "Transfer record not found" });
+        
+        const t = meta[0];
+        const officialPar = parseFloat(t.official_par || 5000);
+        const qty = parseInt(t.shares_count);
+        const salePrice = parseFloat(t.price_per_share || officialPar);
+        const feeCollected = parseFloat(t.service_fee || 0);
+
+        let finalReceiverId = t.transferee_id;
+
+        // 2. Handle New Shareholder Creation (Requirement 2.13)
+        if (t.transferee_type === 'NEW' && t.new_transferee_data) {
+            const p = JSON.parse(t.new_transferee_data);
+            const newShID = await generateSequence('SHAREHOLDER', 'Main Branch');
+            
+            const [newPerson] = await db.promise().execute(
+                `INSERT INTO shareholders (shareholder_id, full_name, phone, email, id_number, gender, dob, nationality, occupation, status, created_by, type, branch_name) 
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Active', ?, 'Individual', 'Main Branch')`,
+                [newShID, p.full_name, p.phone, p.email || null, p.id_number, p.gender, p.dob || null, p.nationality || 'Ethiopian', p.occupation || null, admin]
+            );
+            finalReceiverId = newPerson.insertId;
+        }
+
+        // 3. THE CORE LOGIC: Movement at Par Value (Requirement 2.4.7)
+        // Capital moves at officialPar. The difference is the seller's profit.
+        const movementBirr = qty * officialPar; 
+
+        // DEDUCT SENDER (Seller)
+        await db.promise().execute(
+            `UPDATE shareholders SET 
+             no_of_share = no_of_share - ?, no_of_share_birr = no_of_share_birr - ?,
+             paidup_share = paidup_share - ?, paidup_birr = paidup_birr - ?
+             WHERE id = ?`,
+            [qty, movementBirr, qty, movementBirr, t.transferor_id]
+        );
+
+        // ADD RECEIVER (Buyer)
+        await db.promise().execute(
+            `UPDATE shareholders SET 
+             no_of_share = no_of_share + ?, no_of_share_birr = no_of_share_birr + ?,
+             paidup_share = paidup_share + ?, paidup_birr = paidup_birr + ?
+             WHERE id = ?`,
+            [qty, movementBirr, qty, movementBirr, finalReceiverId]
+        );
+
+        // 4. LOG THE AUDIT (Including Market Price and Service Fee)
+        logAction(t.transferor_id, 'APPROVE', admin, { 
+            event: 'Shares Transferred Out', 
+            qty: qty,
+            sold_at: salePrice,
+            bank_fee: feeCollected
+        });
+        logAction(finalReceiverId, 'APPROVE', admin, { 
+            event: 'Shares Received', 
+            qty: qty,
+            price: salePrice 
+        });
+
+        // 5. Finalize Transfer Status
+        await db.promise().execute(
+            "UPDATE share_transfers SET status = 'Approved', transferee_id = ?, checker_id = ? WHERE id = ?", 
+            [finalReceiverId, admin, id]
+        );
+
+        res.json({ success: true, message: "Movement Approved & Registry Updated" });
+
+    } catch (e) {
+        console.error("❌ APPROVAL ERROR:", e);
+        res.status(500).json({ error: "System error during approval. Check server console." });
+    }
+});
+
+// --- 2. GET TRANSFER HISTORY (Fixed for NEW receivers) ---
+// --- PAGINATED TRANSFER HISTORY (Section 2.4.10) ---
+app.get('/api/transfers', (req, res) => {
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 10;
+    const search = req.query.search || '';
+    const offset = (page - 1) * limit;
+    const searchPattern = `%${search}%`;
+
+    // 1. Get total count for pagination UI
+    const countQuery = `
+        SELECT COUNT(*) as total 
+        FROM share_transfers t
+        JOIN shareholders s1 ON t.transferor_id = s1.id
+        LEFT JOIN shareholders s2 ON t.transferee_id = s2.id
+        WHERE (s1.full_name LIKE ? OR s2.full_name LIKE ? OR t.new_transferee_data LIKE ?)`;
+    
+    db.query(countQuery, [searchPattern, searchPattern, searchPattern], (err, countRes) => {
+        if (err) return res.status(500).json(err);
+        const totalRecords = countRes[0].total;
+
+        // 2. Get the specific 10 records for this page
+        const dataQuery = `
+            SELECT t.*, s1.full_name as transferor_name, s2.full_name as transferee_name 
+            FROM share_transfers t
+            JOIN shareholders s1 ON t.transferor_id = s1.id
+            LEFT JOIN shareholders s2 ON t.transferee_id = s2.id
+            WHERE (s1.full_name LIKE ? OR s2.full_name LIKE ? OR t.new_transferee_data LIKE ?)
+            ORDER BY t.id DESC LIMIT ? OFFSET ?`;
+
+        db.execute(dataQuery, [searchPattern, searchPattern, searchPattern, limit, offset], (err, results) => {
+            if (err) return res.status(500).json(err);
+            res.json({
+                data: results,
+                pagination: {
+                    totalRecords,
+                    totalPages: Math.ceil(totalRecords / limit) || 1,
+                    currentPage: page
+                }
+            });
+        });
+    });
+});
+
+// --- 1. SEARCH SHAREHOLDERS FOR DROPDOWNS ---
+app.get('/api/shareholders/search', (req, res) => {
+    const term = `%${req.query.q}%`;
+    const query = "SELECT id, shareholder_id, full_name, no_of_share FROM shareholders WHERE full_name LIKE ? OR shareholder_id LIKE ? LIMIT 10";
+    db.execute(query, [term, term], (err, results) => {
+        if (err) return res.status(500).json(err);
+        res.json(results);
+    });
+});
+
+
+// --- 3. INITIATE TRANSFER (The ONLY Post Route) ---
+// 1. UPDATE MULTER TO ACCEPT MULTIPLE SPECIFIC FILES
+app.post('/api/transfers', upload.fields([
+    { name: 'transfer_deed', maxCount: 1 },
+    { name: 'id_doc', maxCount: 1 },
+    { name: 'legal_instrument', maxCount: 1 }
+]), (req, res) => {
+    const d = req.body;
+    const files = req.files;
+    const user = d.performed_by || 'Unknown Maker';
+
+    // 2. CHECK FOR COMPLETENESS (Section 2.4.3.2)
+    if (!files['transfer_deed']) {
+        return res.status(400).json({ message: "Mandatory Document Missing: Transfer Deed is required." });
+    }
+
+    db.query("SELECT no_of_share, pledged_shares, is_frozen FROM shareholders WHERE id = ?", [d.transferor_id], (err, results) => {
+    const sh = results[0];
+    const availableBalance = sh.no_of_share - sh.pledged_shares;
+
+    // 1. Check if account is Frozen (Requirement 2.4.4.3)
+    if (sh.is_frozen) {
+        return res.status(403).json({ message: "Security Alert: This shareholder account is FROZEN by regulatory order." });
+    }
+
+    // 2. Check Available Balance (Requirement 2.4.4.2)
+    if (parseInt(d.shares_count) > availableBalance) {
+        return res.status(400).json({ 
+            message: `Insufficient Funds: This member only has ${availableBalance} shares available (Total: ${sh.no_of_share}, Pledged: ${sh.pledged_shares}).` 
+        });
+    }
+
+const query = `INSERT INTO share_transfers 
+    (transfer_type, transferor_id, transferee_id, shares_count, price_per_share, 
+     total_consideration, reason, maker_id, status, transferee_type, 
+     new_transferee_data, effective_date, transfer_deed_path, service_fee) 
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Pending', ?, ?, ?, ?, ?)`;
+
+// 2. Map the 13 values (The 14th is the hardcoded 'Pending')
+const values = [
+    d.type || 'TRANSFER', 
+    d.transferor_id, 
+    d.transferee_id || null, 
+    d.shares_count, 
+    d.price || 1000, 
+    (parseInt(d.shares_count) * parseFloat(d.price || 1000)), 
+    d.reason, 
+    user,
+    d.transferee_type || 'EXISTING',
+    d.new_transferee_data || null,
+    d.effective_date,
+    files['transfer_deed'] ? files['transfer_deed'][0].filename : null,
+    parseFloat(d.service_fee) || 0 // <--- ADD THIS
+];
+
+    db.execute(query, values, (err) => {
+        if (err) return res.status(500).json({ message: "Database Error" });
+        res.json({ success: true });
+    });
+});
+});
+
+// 1. REJECT TRANSFER (Checker Action)
+app.put('/api/transfers/:id/reject', (req, res) => {
+    const { id } = req.params;
+    const { reason, performed_by } = req.body;
+
+    const query = "UPDATE share_transfers SET status = 'Rejected', rejection_reason = ?, checker_id = ? WHERE id = ?";
+    db.execute(query, [reason, performed_by, id], (err) => {
+        if (err) return res.status(500).json(err);
+        res.json({ success: true });
+    });
+});
+
+// 2. CANCEL TRANSFER (Maker Action - before approval)
+app.put('/api/transfers/:id/cancel', (req, res) => {
+    const { id } = req.params;
+    const query = "UPDATE share_transfers SET status = 'Cancelled' WHERE id = ? AND status = 'Pending'";
+    db.execute(query, [id], (err) => {
+        if (err) return res.status(500).json(err);
+        res.json({ success: true, message: "Movement cancelled by maker." });
+    });
+});
+
+// 3. AMEND/UPDATE TRANSFER (Maker Action - before approval)
+app.put('/api/transfers/:id', upload.fields([{ name: 'deed' }, { name: 'legal' }]), (req, res) => {
+    const { id } = req.params;
+    const d = req.body;
+    
+    const query = `UPDATE share_transfers SET 
+        transfer_type=?, shares_count=?, reason=?, transferee_type=?, new_transferee_data=? 
+        WHERE id=? AND status='Pending'`;
+    
+    db.execute(query, [d.type, d.shares_count, d.reason, d.transferee_type, d.new_transferee_data, id], (err) => {
+        if (err) return res.status(500).json(err);
+        res.json({ success: true, message: "Movement amended successfully." });
+    });
+});
+
+// TRANSFER & TRANSMISSION ANALYTICS (Section 2.4.10)
+app.get('/api/reports/transfer-stats', (req, res) => {
+    const queries = {
+        // Summary Counts (Requirement 10.1 - 10.3)
+        summary: `
+            SELECT 
+                COUNT(*) as total_requests,
+                SUM(CASE WHEN status = 'Pending' THEN 1 ELSE 0 END) as pending,
+                SUM(CASE WHEN status = 'Approved' THEN 1 ELSE 0 END) as completed,
+                SUM(CASE WHEN status = 'Rejected' THEN 1 ELSE 0 END) as rejected
+            FROM share_transfers`,
+        
+        // Breakdown by Type (Requirement 10.1 & 10.2)
+        by_type: `
+            SELECT transfer_type, COUNT(*) as count, SUM(shares_count) as total_shares 
+            FROM share_transfers 
+            GROUP BY transfer_type`,
+            
+        // Inheritance Tracking (Requirement 10.6)
+        inheritance_cases: `
+            SELECT COUNT(*) as count, SUM(shares_count) as total_shares 
+            FROM share_transfers 
+            WHERE transfer_type = 'TRANSMISSION' OR reason LIKE '%Inheritance%' OR reason LIKE '%Succession%'`,
+            
+        // Volume by Month (Requirement 10.5)
+        monthly_trend: `
+            SELECT DATE_FORMAT(effective_date, '%M %Y') as month, COUNT(*) as count 
+            FROM share_transfers 
+            WHERE status = 'Approved'
+            GROUP BY month 
+            ORDER BY effective_date DESC LIMIT 6`
+    };
+
+    const results = {};
+    const keys = Object.keys(queries);
+    let completed = 0;
+
+    keys.forEach(key => {
+        db.query(queries[key], (err, data) => {
+            if (err) return res.status(500).json(err);
+            results[key] = data;
+            completed++;
+            if (completed === keys.length) res.json(results);
+        });
+    });
+});
+
+// EXPORT TRANSFER AUDIT LOGS (Section 2.4.10.7)
+app.get('/api/reports/export-transfer-audit', (req, res) => {
+    // Query logs related to creation, approval, and rejection of movements
+    const query = `
+        SELECT 
+            created_at as Timestamp, 
+            performed_by as User, 
+            action_type as Action, 
+            details as RawDetails 
+        FROM audit_logs 
+        WHERE action_type IN ('CREATE', 'UPDATE', 'APPROVE', 'REJECT')
+        ORDER BY created_at DESC`;
+
+    db.query(query, (err, results) => {
+        if (err) return res.status(500).json(err);
+        
+        const csvHeader = "Date/Time,User,Action Type,Activity Details\n";
+        const csvRows = results.map(r => {
+            // Clean the JSON details so they look good in one Excel cell
+            let activityInfo = "N/A";
+            try {
+                const parsed = typeof r.RawDetails === 'string' ? JSON.parse(r.RawDetails) : r.RawDetails;
+                activityInfo = parsed.event || parsed.info || "Action Performed";
+            } catch (e) { activityInfo = "Data available in system"; }
+
+            return `"${r.Timestamp}","${r.User}","${r.Action}","${activityInfo}"`;
+        }).join("\n");
+        
+        res.setHeader('Content-Type', 'text/csv');
+        res.setHeader('Content-Disposition', 'attachment; filename=Movement_Audit_Log.csv');
+        res.status(200).send(csvHeader + csvRows);
+    });
+});
+
+// --- 1. GET ALL CORPORATE ACTIONS (Fixes the 404 error) ---
+app.get('/api/corporate-actions', (req, res) => {
+    const query = "SELECT * FROM corporate_actions ORDER BY created_at DESC";
+    db.query(query, (err, results) => {
+        if (err) return res.status(500).json(err);
+        res.json(results);
+    });
+});
+
+// --- 2. INITIATE CORPORATE ACTION (Maker) ---
+// 1. UPDATE TO ACCEPT 3 SPECIFIC LEGAL DOCUMENTS
+app.post('/api/corporate-actions', upload.fields([
+    { name: 'board_res', maxCount: 1 },
+    { name: 'sh_res', maxCount: 1 },
+    { name: 'reg_approval', maxCount: 1 }
+]), (req, res) => {
+    const d = req.body;
+    const files = req.files;
+    const user = d.performed_by || 'Admin';
+
+    const query = `INSERT INTO corporate_actions 
+        (action_type, ratio_base, ratio_new, record_date, effective_date, board_resolution_no, description, maker_id, status, board_res_path, sh_res_path, reg_approval_path) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Pending Approval', ?, ?, ?)`;
+    
+    const values = [
+        d.type, d.ratio_base, d.ratio_new, d.record_date, d.effective_date, 
+        d.board_res, d.description || '', user,
+        files['board_res'] ? files['board_res'][0].filename : null,
+        files['sh_res'] ? files['sh_res'][0].filename : null,
+        files['reg_approval'] ? files['reg_approval'][0].filename : null
+    ];
+
+db.execute(query, values, (err, result) => {
+        if (err) {
+        if (err.code === 'ER_DUP_ENTRY') {
+            return res.status(400).json({ error: "Duplicate Reference: This Slip Number has already been used in the system." });
+        }
+        return res.status(500).json({ error: "Database error" });
+    }
+
+    // LOG THE INITIATION (Requirement 8.2)
+    logAction('SYSTEM', 'CREATE', user, {
+        event: `Proposed ${d.type}`,
+        ratio: `${d.ratio_new}:${d.ratio_base}`,
+        board_res: d.board_res,
+        effective_date: d.effective_date,
+        impact_estimate: "Calculated at initiation"
+    });
+
+    res.json({ success: true });
+});
+});
+
+// --- 3. EXECUTE CORPORATE ACTION (Checker Approval - Requirement 2.6.4) ---
+// --- FIX FOR: DOUBLE value is out of range (* 0) ---
+app.put('/api/corporate-actions/:id/execute', async (req, res) => {
+    const { id } = req.params;
+    const admin = req.body.performed_by || 'System Admin';
+
+    db.query("SELECT * FROM corporate_actions WHERE id = ?", [id], async (err, results) => {
+        if (err || !results[0]) return res.status(404).json({ message: "Action not found" });
+        const action = results[0];
+
+        try {
+            // MATH FIX: Calculate exactly as a number
+            const ratioValue = parseFloat(action.ratio_new) / parseFloat(action.ratio_base);
+
+            if (isNaN(ratioValue) || ratioValue === 0) {
+                return res.status(400).json({ message: "Invalid ratio detected in database." });
+            }
+
+            // === SNAPSHOT #1: capture OLD capital state, BEFORE any UPDATE runs ===
+            const [currentCap] = await db.promise().execute(`
+                SELECT 
+                    (SELECT authorized_capital FROM capital_history ORDER BY id DESC LIMIT 1) as old_auth,
+                    (SELECT par_value FROM share_classes WHERE id = 1) as old_par
+            `);
+            const oldAuthorized = currentCap[0].old_auth;
+            // === END SNAPSHOT #1 ===
+
+            if (action.action_type === 'BONUS_ISSUE') {
+                const updateQuery = `
+    UPDATE shareholders 
+    SET no_of_share = no_of_share + FLOOR(no_of_share * ?),
+        no_of_share_birr = no_of_share_birr + (no_of_share_birr * ?),
+        paidup_share = paidup_share + FLOOR(paidup_share * ?),
+        paidup_birr = paidup_birr + (paidup_birr * ?)
+    WHERE status = 'Active' 
+    AND DATE(registration_date) <= DATE(?)`;
+
+                // FIX: pass ratioValue (not the undefined 'ratio') 4 times to match the 4 '?' marks
+                const [res1] = await db.promise().execute(updateQuery, [ratioValue, ratioValue, ratioValue, ratioValue, action.record_date]);
+                console.log(`Bonus applied to ${res1.affectedRows} shareholders`);
+            } 
+            else if (action.action_type === 'SHARE_SPLIT' || action.action_type === 'CONSOLIDATION') {
+                const [currentClass] = await db.promise().execute("SELECT id, par_value FROM share_classes WHERE id = 1");
+                const oldPar = currentClass[0].par_value;
+                const newPar = oldPar / ratioValue;
+
+                await db.promise().execute(
+                    "UPDATE certificates SET status = 'Cancelled', cancellation_reason = ? WHERE status = 'Active'",
+                    [`Superseded by ${action.action_type} (${action.ratio_new}:${action.ratio_base})`]
+                );
+
+                const updateQuery = `
+                    UPDATE shareholders 
+                    SET no_of_share = FLOOR(no_of_share * ?),
+                        paidup_share = FLOOR(paidup_share * ?)
+                    WHERE status = 'Active'`;
+                await db.promise().execute(updateQuery, [ratioValue, ratioValue]);
+
+                await db.promise().execute("UPDATE share_classes SET par_value = ?, updated_by = ? WHERE id = 1", [newPar, admin]);
+
+                await db.promise().execute(
+                    "INSERT INTO par_value_history (share_class_id, old_par_value, new_par_value, effective_date, corporate_action_id) VALUES (?, ?, ?, ?, ?)",
+                    [1, oldPar, newPar, action.effective_date, id]
+                );
+            }
+
+            // === SNAPSHOT #2: log the capital-history entry AFTER the action's logic ran ===
+            const historyQuery = `INSERT INTO capital_history 
+                (event_type, previous_capital, authorized_capital, board_resolution_no, shareholder_resolution_no, reg_approval_ref, effective_date, performed_by, action_id) 
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+
+            const newAuthorized = (action.action_type === 'INCREASE') ? action.ratio_new : oldAuthorized; 
+
+            await db.promise().execute(historyQuery, [
+                action.action_type,
+                oldAuthorized,
+                newAuthorized,
+                action.board_resolution_no,
+                action.shareholder_resolution_no || 'N/A',
+                action.reg_approval_ref || 'PENDING',
+                action.effective_date,
+                admin,
+                id
+            ]);
+            // === END SNAPSHOT #2 ===
+
+            // Finalize status
+            db.execute("UPDATE corporate_actions SET status = 'Executed', checker_id = ? WHERE id = ?", [admin, id], () => {
+                res.json({ 
+                    success: true, 
+                    message: `Corporate Action ${action.action_type} executed successfully!` 
+                });
+            });
+
+        } catch (e) {
+            console.error("Execution error:", e);
+            res.status(500).json({ error: e.message });
+        }
+    });
+});
+
+// 1. REJECT CORPORATE ACTION (Checker Action)
+app.put('/api/corporate-actions/:id/reject', (req, res) => {
+    const { id } = req.params;
+    const { reason, performed_by } = req.body;
+
+    const query = "UPDATE corporate_actions SET status = 'Rejected', rejection_reason = ?, checker_id = ? WHERE id = ?";
+    db.execute(query, [reason, performed_by, id], (err) => {
+        if (err) return res.status(500).json(err);
+        logAction('GLOBAL', 'REJECT', performed_by, { event: 'Corporate Action Rejected', id, reason });
+        res.json({ success: true });
+    });
+});
+
+// 2. UPDATE/EDIT PROPOSAL (Maker Action)
+app.put('/api/corporate-actions/:id', (req, res) => {
+    const { id } = req.params;
+    const d = req.body;
+    
+    const query = `UPDATE corporate_actions SET 
+        action_type=?, ratio_base=?, ratio_new=?, record_date=?, 
+        effective_date=?, board_resolution_no=?, description=? 
+        WHERE id=? AND status='Pending Approval'`;
+    
+    db.execute(query, [d.type, d.ratio_base, d.ratio_new, d.record_date, d.effective_date, d.board_res, d.description, id], (err) => {
+        if (err) return res.status(500).json(err);
+        res.json({ success: true });
+    });
+});
+
+// 1. GET ELIGIBLE MEMBERS for a Rights Issue (Requirement 2.3)
+app.get('/api/corporate-actions/:id/eligible', (req, res) => {
+    const actionId = req.params.id;
+    db.query("SELECT record_date FROM corporate_actions WHERE id = ?", [actionId], (err, result) => {
+        const date = result[0].record_date;
+        const query = "SELECT id, shareholder_id, full_name, no_of_share FROM shareholders WHERE status='Active' AND registration_date <= ?";
+        db.execute("UPDATE corporate_actions SET status = 'Executed', checker_id = ? WHERE id = ?", [admin, id], () => {
+    
+    // LOG THE EXECUTION (Requirement 8.2 & 8.3)
+    logAction('SYSTEM', 'APPROVE', admin, {
+        event: `Executed ${action.action_type}`,
+        ratio: `${action.ratio_new}:${action.ratio_base}`,
+        affected_rows: updateResult.affectedRows, // From the SQL update
+        logic: "Mass Registry Update completed"
+    });
+
+    res.json({ success: true, message: "Action executed and logged." });
+});
+    });
+});
+
+// 2. RECORD APPLICATION (Requirement 2.5)
+app.post('/api/rights/apply', (req, res) => {
+    const d = req.body;
+    const query = `INSERT INTO rights_applications 
+        (corporate_action_id, shareholder_id, shares_requested, amount_to_pay, payment_reference, status) 
+        VALUES (?, ?, ?, ?, ?, 'Paid')`;
+    
+    db.execute(query, [d.action_id, d.shareholder_id, d.shares, d.amount, d.ref], (err) => {
+        if (err) return res.status(500).json(err);
+        res.json({ success: true });
+    });
+});
+
+// GET CURRENT BANK TOTALS FOR IMPACT ANALYSIS
+app.get('/api/capital/current-status', (req, res) => {
+    const query = `
+        SELECT 
+            IFNULL(SUM(no_of_share), 0) as total_shares,
+            IFNULL((SELECT par_value FROM share_classes WHERE id = 1), 0) as par_value
+        FROM shareholders 
+        WHERE status = 'Active'`; // <--- Ensure it only counts 'Active' members
+    
+    db.query(query, (err, results) => {
+        if (err) return res.status(500).json(err);
+        res.json(results[0]);
+    });
+});
+
+// CORPORATE ACTIONS ANALYTICS (Section 2.6.9)
+app.get('/api/reports/corporate-action-stats', (req, res) => {
+    const queries = {
+        // Summary of events (Requirement 9.1, 9.3, 9.5)
+        event_summary: `
+            SELECT action_type, COUNT(*) as total_events, status 
+            FROM corporate_actions 
+            GROUP BY action_type, status`,
+        
+        // Detailed History of Capital Structure Changes (Requirement 9.5 & 3.8)
+        par_value_history: `
+            SELECT h.*, c.action_type, c.board_resolution_no 
+            FROM par_value_history h
+            JOIN corporate_actions c ON h.corporate_action_id = c.id
+            ORDER BY h.effective_date DESC`,
+
+        // Impact on total share quantity (Requirement 9.6)
+        shares_created: `
+            SELECT action_type, SUM(ratio_new / ratio_base) as total_multiplier
+            FROM corporate_actions 
+            WHERE status = 'Executed'
+            GROUP BY action_type`
+    };
+
+    const results = {};
+    const keys = Object.keys(queries);
+    let completed = 0;
+
+    keys.forEach(key => {
+        db.query(queries[key], (err, data) => {
+            if (err) return res.status(500).json(err);
+            results[key] = data;
+            completed++;
+            if (completed === keys.length) res.json(results);
+        });
+    });
+});
+
+app.get('/api/reports/export-participation', (req, res) => {
+    // This query pulls the audit log entries specifically for corporate actions
+    const query = `
+        SELECT created_at, performed_by, action_type, details 
+        FROM audit_logs 
+        WHERE action_type = 'UPDATE' AND shareholder_id = 'GLOBAL'
+        ORDER BY created_at DESC`;
+
+    db.query(query, (err, results) => {
+        if (err) return res.status(500).json(err);
+        const csvHeader = "Timestamp,Performed By,Action,Impact Details\n";
+        const csvRows = results.map(r => `"${r.created_at}","${r.performed_by}","${r.action_type}","${r.details.replace(/"/g, '""')}"`).join("\n");
+        
+        res.setHeader('Content-Type', 'text/csv');
+        res.setHeader('Content-Disposition', 'attachment; filename=Capital_Action_Participation.csv');
+        res.status(200).send(csvHeader + csvRows);
+    });
+});
+
+// --- 1. GET ALL DIVIDEND DECLARATIONS ---
+app.get('/api/dividends', (req, res) => {
+    const query = "SELECT * FROM dividend_declarations ORDER BY created_at DESC";
+    db.query(query, (err, results) => {
+        if (err) {
+            console.error("Database Error (Get Dividends):", err);
+            return res.status(500).json({ success: false, error: err.message });
+        }
+        res.json(results); // FIXED: Only one .json() call
+    });
+});
+
+// --- 2. DECLARE NEW DIVIDEND ---
+app.post('/api/dividends/declare', (req, res) => {
+    const d = req.body;
+    const user = d.performed_by || 'Admin';
+    
+    const query = `INSERT INTO dividend_declarations 
+        (financial_year, share_class_id, dividend_type, dividend_per_share, 
+         declaration_date, record_date, ex_dividend_date, payment_date, 
+         board_res_no, shareholder_res_no, tax_rate_percent, maker_id, status) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Draft')`;
+    
+    const values = [
+        d.year, d.share_class_id || 1, d.type || 'Final', d.rate,
+        d.decl_date, d.record_date, d.ex_date, d.pay_date,
+        d.board_res, d.sh_res, d.tax, user
+    ];
+
+    db.execute(query, values, (err, result) => {
+    if (err) return res.status(500).json(err);
+    // AUDIT LOG (Requirement 7.1)
+    logAction('DIVIDEND_SYSTEM', 'CREATE', user, { 
+        event: 'New Dividend Declared', 
+        year: d.year, 
+        rate: d.rate,
+        ref: d.board_res 
+    });
+    res.json({ success: true, id: result.insertId });
+});
+});
+
+// --- 3. RUN MASS DIVIDEND CALCULATIONS (The Engine) ---
+app.post('/api/dividends/:id/calculate', async (req, res) => {
+    const decId = req.params.id;
+
+    // 1. Get the declaration parameters
+    db.query("SELECT * FROM dividend_declarations WHERE id = ?", [decId], async (err, decResults) => {
+        if (err || !decResults[0]) return res.status(404).json({ message: "Declaration not found" });
+        
+        const dec = decResults[0];
+        const taxRate = dec.tax_rate_percent / 100;
+
+        // 2. ELIGIBILITY LOGIC (Requirement 2.7.2.1 & 2.7.2.4)
+        // We only pull 'Active' shareholders who were registered on or before the record date
+        // AND who belong to the specific share class being paid.
+        const shQuery = `
+            SELECT id, no_of_share 
+            FROM shareholders 
+            WHERE status = 'Active' 
+            AND share_class_id = ?
+            AND DATE(registration_date) <= DATE(?)`;
+        
+        db.query(shQuery, [dec.share_class_id, dec.record_date], async (err, members) => {
+            if (err) return res.status(500).json(err);
+            
+            try {
+                // 3. RECALCULATION LOGIC (Requirement 2.7.2.5)
+                // We delete old calculations for this ID so we can start fresh if corrections were made
+                await db.promise().execute("DELETE FROM dividend_payouts WHERE declaration_id = ?", [decId]);
+
+                const payoutValues = members.map(m => {
+    const gross = parseFloat(m.no_of_share) * parseFloat(dec.dividend_per_share);
+    const tax = gross * taxRate;
+    const net = gross - tax;
+    // Map the 7 columns: dec_id, sh_id, shares, gross, tax, net, status, method
+    return [decId, m.id, m.no_of_share, gross, tax, net, 'Unpaid', m.payment_method || 'Bank Transfer'];
+});
+
+                if (payoutValues.length > 0) {
+                    // Bulk Insert for performance (10,000 rows in one go)
+                    const query = "INSERT INTO dividend_payouts (declaration_id, shareholder_id, shares_at_record_date, gross_dividend, tax_withheld, net_dividend, payment_status, payment_method) VALUES ?";
+                    await db.promise().execute(query, [payoutValues]);
+                }
+
+                // 4. Update status to 'Ready for Approval'
+                await db.promise().execute("UPDATE dividend_declarations SET status = 'Ready for Approval' WHERE id = ?", [decId]);
+                logAction('DIVIDEND_SYSTEM', 'UPDATE', 'System Engine', { 
+    event: 'Mass Entitlement Calculation Completed', 
+    declaration_id: decId,
+    members_processed: members.length 
+});
+                res.json({ success: true, count: members.length });
+
+            } catch (e) { 
+                res.status(500).json({ error: "Bulk calculation engine failed." }); 
+            }
+        });
+    });
+});
+
+app.get('/api/dividends/:id/payouts', (req, res) => {
+    const query = `
+        SELECT p.*, s.full_name, s.shareholder_id 
+        FROM dividend_payouts p 
+        JOIN shareholders s ON p.shareholder_id = s.id 
+        WHERE p.declaration_id = ? 
+        ORDER BY p.gross_dividend DESC LIMIT 100`; // Limit to top 100 for UI performance
+    
+    db.query(query, [req.params.id], (err, results) => {
+        if (err) return res.status(500).json(err);
+        res.json(results);
+    });
+});
+
+// DOWNLOAD BANK BATCH FILE (Requirement 2.7.3.3)
+app.get('/api/dividends/:id/export-schedule', (req, res) => {
+    const query = `
+        SELECT s.full_name, s.bank_account, p.net_dividend, p.payment_method 
+        FROM dividend_payouts p 
+        JOIN shareholders s ON p.shareholder_id = s.id 
+        WHERE p.declaration_id = ? AND p.payment_method = 'Bank Transfer'`;
+    
+    db.query(query, [req.params.id], (err, results) => {
+        if (err) return res.status(500).json(err);
+        
+        const csvHeader = "Account Name,Account Number,Amount,Currency,Remark\n";
+        const csvRows = results.map(r => 
+            `"${r.full_name}","${r.bank_account}",${r.net_dividend},"ETB","Dividend Payout"`
+        ).join("\n");
+        
+        res.setHeader('Content-Type', 'text/csv');
+        res.setHeader('Content-Disposition', `attachment; filename=Dividend_Batch_Run_${req.params.id}.csv`);
+        res.status(200).send(csvHeader + csvRows);
+    });
+});
+
+// TAX COMPLIANCE REPORT (Requirement 4.3)
+app.get('/api/reports/tax-compliance', (req, res) => {
+    const query = `
+        SELECT 
+            d.financial_year,
+            d.dividend_type,
+            COUNT(p.id) as total_shareholders,
+            SUM(p.gross_dividend) as total_gross,
+            SUM(p.tax_withheld) as total_tax_obligation,
+            SUM(p.net_dividend) as total_net_payout
+        FROM dividend_payouts p
+        JOIN dividend_declarations d ON p.declaration_id = d.id
+        WHERE d.status = 'Approved' OR d.status = 'Completed'
+        GROUP BY d.financial_year, d.dividend_type
+        ORDER BY d.financial_year DESC`;
+
+    db.query(query, (err, results) => {
+        if (err) return res.status(500).json(err);
+        res.json(results);
+    });
+});
+
+// MASTER DIVIDEND REGISTER (Section 2.7.6)
+app.get('/api/dividends/master-register', (req, res) => {
+    const search = req.query.search || '';
+    const year = req.query.year || '';
+    const searchPattern = `%${search}%`;
+
+    let query = `
+        SELECT 
+            p.id as payout_id,
+            s.shareholder_id as sh_code,
+            s.full_name,
+            d.financial_year,
+            d.dividend_per_share as rate,
+            p.shares_at_record_date as eligible_shares,
+            p.gross_dividend,
+            p.tax_withheld,
+            p.net_dividend,
+            p.payment_status,
+            d.payment_date
+        FROM dividend_payouts p
+        JOIN shareholders s ON p.shareholder_id = s.id
+        JOIN dividend_declarations d ON p.declaration_id = d.id
+        WHERE (s.full_name LIKE ? OR s.shareholder_id LIKE ?)
+    `;
+    
+    let params = [searchPattern, searchPattern];
+
+    if (year) {
+        query += " AND d.financial_year = ?";
+        params.push(year);
+    }
+
+    query += " ORDER BY d.financial_year DESC, p.gross_dividend DESC LIMIT 500";
+
+    db.query(query, params, (err, results) => {
+        if (err) return res.status(500).json(err);
+        res.json(results);
+    });
+});
+
+app.put('/api/dividends/:id/approve', (req, res) => {
+    const { id } = req.params;
+    const user = req.body.performed_by;
+    
+    db.execute("UPDATE dividend_declarations SET status = 'Approved', checker_id = ? WHERE id = ?", [user, id], (err) => {
+        // AUDIT LOG (Requirement 7.2)
+        logAction('DIVIDEND_SYSTEM', 'APPROVE', user, { 
+            event: 'Dividend Run Approved for Payment', 
+            declaration_id: id 
+        });
+        res.json({ success: true });
+    });
+});
+
+app.get('/api/dividends/:id/audit', (req, res) => {
+    // We search the 'details' JSON for the specific declaration ID
+    const query = `
+        SELECT * FROM audit_logs 
+        WHERE (shareholder_id = 'DIVIDEND_SYSTEM' OR details LIKE ?) 
+        AND details LIKE ?
+        ORDER BY created_at DESC`;
+    
+    db.execute(query, [`%${req.params.id}%`, `%${req.params.id}%`], (err, results) => {
+        if (err) return res.status(500).json(err);
+        res.json(results);
+    });
+});
+
+// DIVIDEND ANALYTICS REPORT (Section 2.7.8)
+app.get('/api/reports/dividend-stats', (req, res) => {
+    const queries = {
+        // High level overview (Requirement 8.1, 8.4, 8.5)
+        summary: `
+            SELECT 
+                COUNT(id) as total_runs,
+                SUM(dividend_per_share) as total_rates,
+                (SELECT SUM(gross_dividend) FROM dividend_payouts) as total_declared_birr,
+                (SELECT SUM(net_dividend) FROM dividend_payouts WHERE payment_status = 'Paid') as total_paid_birr,
+                (SELECT SUM(net_dividend) FROM dividend_payouts WHERE payment_status = 'Unpaid') as total_unpaid_birr
+            FROM dividend_declarations WHERE status IN ('Approved', 'Completed')`,
+        
+        // Tax Summary (Requirement 8.7)
+        tax_report: `
+            SELECT financial_year, SUM(tax_withheld) as total_tax 
+            FROM dividend_payouts p 
+            JOIN dividend_declarations d ON p.declaration_id = d.id 
+            GROUP BY financial_year`,
+
+        // Payment Status Breakdown (Requirement 8.4)
+        payment_status: `
+            SELECT payment_status, COUNT(*) as count, SUM(net_dividend) as amount 
+            FROM dividend_payouts 
+            GROUP BY payment_status`
+    };
+
+    const results = {};
+    const keys = Object.keys(queries);
+    let completed = 0;
+
+    keys.forEach(key => {
+        db.query(queries[key], (err, data) => {
+            if (err) return res.status(500).json(err);
+            results[key] = data;
+            completed++;
+            if (completed === keys.length) res.json(results);
+        });
+    });
+});
+
+// REGULATORY & MANAGEMENT REPORTS (Section 2.9)
+app.get('/api/reports/statutory-stats', (req, res) => {
+    const queries = {
+        // 1. Ownership Concentration (Requirement 2.9.5)
+        concentration: `
+            SELECT 
+                (SELECT SUM(no_of_share_birr) FROM shareholders WHERE status='Active') as total_capital,
+                SUM(no_of_share_birr) as top_10_capital,
+                (SUM(no_of_share_birr) / (SELECT SUM(no_of_share_birr) FROM shareholders WHERE status='Active') * 100) as concentration_ratio
+            FROM (SELECT no_of_share_birr FROM shareholders WHERE status='Active' ORDER BY no_of_share DESC LIMIT 10) as top_ten`,
+        
+        // 2. Top 10 Shareholders (Requirement 2.9.5)
+        top_shareholders: `
+            SELECT full_name, shareholder_id, no_of_share, 
+            (no_of_share / (SELECT SUM(no_of_share) FROM shareholders WHERE status='Active') * 100) as ownership_pct
+            FROM shareholders WHERE status='Active' 
+            ORDER BY no_of_share DESC LIMIT 10`,
+
+        // 3. Beneficial Ownership (AML Compliance - Requirement 2.9.4)
+        // Identifies anyone with > 2% ownership
+        significant_owners: `
+            SELECT full_name, tin, nationality, no_of_share, 
+            (no_of_share / (SELECT SUM(no_of_share) FROM shareholders WHERE status='Active') * 100) as pct
+            FROM shareholders 
+            WHERE (no_of_share / (SELECT SUM(no_of_share) FROM shareholders WHERE status='Active')) > 0.02
+            AND status='Active'`
+    };
+
+    const results = {};
+    const keys = Object.keys(queries);
+    let completed = 0;
+
+    keys.forEach(key => {
+        db.query(queries[key], (err, data) => {
+            if (err) return res.status(500).json(err);
+            results[key] = data;
+            completed++;
+            if (completed === keys.length) res.json(results);
+        });
+    });
+});
+
+// 1. GET ALL USERS (Admin only)
+app.get('/api/users', (req, res) => {
+    // Ensure branch_name is included in the SELECT
+    db.query("SELECT id, name, email, role, branch_name, is_active FROM users", (err, results) => {
+        if (err) return res.status(500).json(err);
+        res.json(results);
+    });
+});
+
+// 2. CREATE USER
+app.post('/api/users', (req, res) => {
+    const { name, email, password, role, performed_by } = req.body;
+    const query = "INSERT INTO users (name, email, password, role, mustUpdatePassword) VALUES (?, ?, ?, ?, 1)";
+    db.execute(query, [name, email, password, role], (err, result) => {
+        if (err) return res.status(500).json(err);
+        logAction('SYSTEM', 'CREATE', performed_by, { event: `User ${email} created with role ${role}` });
+        res.json({ success: true });
+    });
+});
+
+// --- UPDATED: PASSWORD ROTATION ENGINE ---
+app.post('/api/users/rotate-password', (req, res) => {
+    const { email, newPassword } = req.body;
+
+    // 1. Update the password AND set the flag to 0
+    const query = "UPDATE users SET password = ?, mustUpdatePassword = 0 WHERE email = ?";
+    
+    db.execute(query, [newPassword, email], (err, results) => {
+        if (err) {
+            console.error("Password Update Error:", err);
+            return res.status(500).json({ success: false, message: "Database Error" });
+        }
+        
+        if (results.affectedRows === 0) {
+            return res.status(404).json({ success: false, message: "User not found" });
+        }
+
+        console.log(`✅ Security rotation complete for: ${email}`);
+        res.json({ success: true });
+    });
+});
+
+// 3. TOGGLE USER STATUS (Activate/Deactivate)
+app.put('/api/users/:id/status', (req, res) => {
+    const { id } = req.params;
+    const { status, performed_by } = req.body;
+    db.execute("UPDATE users SET is_active = ? WHERE id = ?", [status, id], (err) => {
+        logAction('SYSTEM', 'UPDATE', performed_by, { event: `User ID ${id} status changed to ${status}` });
+        res.json({ success: true });
+    });
+});
+
+// 1. UPDATE USER DETAILS
+app.put('/api/users/:id', (req, res) => {
+    const { id } = req.params;
+    const { name, email, role, branch_name } = req.body;
+    db.execute("UPDATE users SET name=?, email=?, role=?, branch_name=? WHERE id=?", [name, email, role, branch_name, id], (err) => {
+        if (err) return res.status(500).json(err);
+        res.json({ success: true });
+    });
+});
+
+// 2. PASSWORD RESET (Section 2.10 Security)
+app.post('/api/users/:id/reset-password', (req, res) => {
+    const { id } = req.params;
+    // Resets to default and forces password rotation logic on next login
+    db.execute("UPDATE users SET password='password123', mustUpdatePassword=1 WHERE id=?", [id], (err) => {
+        if (err) return res.status(500).json(err);
+        res.json({ success: true });
+    });
+});
+
+// 1. GET THE FULL PERMISSIONS MATRIX
+app.get('/api/roles/matrix', (req, res) => {
+    const role = req.query.role; // e.g., 'Checker'
+    
+    // This query gets ALL permissions and a '1' or '0' if the specific role has it
+    const query = `
+        SELECT 
+            p.module_name, 
+            p.permission_key, 
+            p.permission_name, 
+            IF(rp.role_name IS NULL, 0, 1) as is_enabled
+        FROM system_permissions p
+        LEFT JOIN role_permissions rp ON p.permission_key = rp.permission_key AND rp.role_name = ?
+        ORDER BY p.module_name, p.permission_name`;
+    
+    db.execute(query, [role], (err, results) => {
+        if (err) return res.status(500).json(err);
+        res.json(results);
+    });
+});
+
+// 2. SAVE THE MATRIX (When you tick/untick)
+app.post('/api/roles/permissions', async (req, res) => {
+    const { role, permissions } = req.body; // permissions is an array of strings ['sh_create', 'sh_approve']
+
+    try {
+        // 1. Delete existing for this role
+        await db.promise().execute("DELETE FROM role_permissions WHERE role_name = ?", [role]);
+        
+        // 2. Insert new ones
+        if (permissions && permissions.length > 0) {
+            const values = permissions.map(p => [role, p]);
+            await db.promise().query("INSERT INTO role_permissions (role_name, permission_key) VALUES ?", [values]);
+        }
+        res.json({ success: true });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// 1. GET ALL DEFINED PERMISSIONS
+app.get('/api/permissions', (req, res) => {
+    db.query("SELECT * FROM system_permissions ORDER BY module_name, permission_name", (err, r) => {
+        if (err) return res.status(500).json(err);
+        res.json(r);
+    });
+});
+
+// 2. DEFINE NEW PERMISSION (Audit Requirement 2.10.6)
+app.post('/api/permissions', (req, res) => {
+    const { key, name, module } = req.body;
+    const query = "INSERT INTO system_permissions (permission_key, permission_name, module_name) VALUES (?, ?, ?)";
+    db.execute(query, [key, name, module], (err) => {
+        if (err) return res.status(500).json(err);
+        res.json({ success: true });
+    });
+});
+
+// GET FULL CAPITAL HISTORY (Requirement 1.5)
+app.get('/api/capital/history', (req, res) => {
+    const query = `
+        SELECT h.*, sc.class_name, sc.par_value 
+        FROM capital_history h
+        JOIN share_classes sc ON h.share_class_id = sc.id
+        ORDER BY h.effective_date DESC`;
+    
+    db.query(query, (err, results) => {
+        if (err) return res.status(500).json(err);
+        res.json(results);
+    });
+});
+
+app.get('/api/capital/issuance-report', (req, res) => {
+    const query = `
+        SELECT 
+            sc.class_name,
+            IFNULL((SELECT SUM(authorized_capital) FROM capital_history WHERE share_class_id = sc.id), 0) as authorized,
+            IFNULL((SELECT SUM(no_of_share_birr) FROM shareholders WHERE share_class_id = sc.id AND status = 'Active'), 0) as issued_active,
+            IFNULL((SELECT SUM(no_of_share_birr) FROM shareholders WHERE share_class_id = sc.id AND status = 'Pending'), 0) as issued_pending
+        FROM share_classes sc`;
+    
+    db.query(query, (err, results) => {
+        if (err) return res.status(500).json(err);
+        res.json(results);
+    });
+});
+
+// --- CAPITAL & EQUITY ANALYTICS (Requirement 8.3 & NBE Transparency) ---
+app.get('/api/reports/capital-analytics', (req, res) => {
+    const queries = {
+        // 1. Current Equity Mix (Preserving existing + adding NBE Staging metrics)
+        equity_mix: `
+    SELECT 
+        -- 1. Promised total
+        IFNULL(SUM(no_of_share_birr), 0) as total_subscribed,
+        IFNULL(SUM(no_of_share_birr), 0) as subscribed, -- for backward compatibility
+
+        -- 2. Staged Capital (Registered POST-CUTOFF + recent installments)
+        (
+            IFNULL(SUM(CASE WHEN registration_phase = 'Post-Nov-24' THEN paidup_birr ELSE 0 END), 0) +
+            IFNULL((SELECT SUM(amount_paid) FROM capital_payments 
+                    WHERE created_at >= '2025-11-24' AND status='Approved' 
+                    AND shareholder_id IN (SELECT id FROM shareholders WHERE registration_phase='Pre-Cutoff')), 0)
+        ) as pending_nbe_amt,
+
+        -- 3. Total Cash (The Blue Card)
+        IFNULL(SUM(paidup_birr), 0) as total_cash_in_hand,
+
+        -- 4. NBE APPROVED (The Green Card & The Top Paid-up Card)
+        -- We name this 'paid_up' so the ratio and top card start working again
+        (
+            IFNULL(SUM(paidup_birr), 0) - 
+            (
+                IFNULL(SUM(CASE WHEN registration_phase = 'Post-Nov-24' THEN paidup_birr ELSE 0 END), 0) +
+                IFNULL((SELECT SUM(amount_paid) FROM capital_payments 
+                        WHERE created_at >= '2025-11-24' AND status='Approved' 
+                        AND shareholder_id IN (SELECT id FROM shareholders WHERE registration_phase='Pre-Cutoff')), 0)
+            )
+        ) as paid_up,
+
+        -- 5. The Gap
+        (IFNULL(SUM(no_of_share_birr), 0) - IFNULL(SUM(paidup_birr), 0)) as outstanding,
+
+        IFNULL(SUM(paidup_premium), 0) as premium
+    FROM shareholders 
+    WHERE status != 'Rejected'`,
+        
+        // 2. Capital by Share Class (Requirement 9.5)
+        by_class: `
+            SELECT sc.class_name, 
+                   SUM(CASE WHEN s.status = 'Active' THEN s.paidup_birr ELSE 0 END) as paid_up,
+                   SUM(CASE WHEN s.registration_phase = 'Post-Nov-24' THEN s.paidup_birr ELSE 0 END) as in_staging
+            FROM share_classes sc
+            LEFT JOIN shareholders s ON s.share_class_id = sc.id AND s.status != 'Rejected'
+            GROUP BY sc.class_name`,
+
+        // 3. Growth Timeline (Requirement 9.7 & 9.9)
+        growth_history: `
+            SELECT effective_date, authorized_capital 
+            FROM capital_history 
+            WHERE status = 'Approved'
+            ORDER BY effective_date ASC`
+    };
+
+    const results = {};
+    const keys = Object.keys(queries);
+    let completed = 0;
+
+    keys.forEach(key => {
+        db.query(queries[key], (err, data) => {
+            if (err) {
+                console.error(`❌ Error in ${key} query:`, err);
+                return res.status(500).json({ error: `Internal Server Error in ${key}` });
+            }
+            results[key] = data;
+            completed++;
+            if (completed === keys.length) res.json(results);
+        });
+    });
+});
+
+// 1. INITIATE ALLOTMENT (Maker)
+// 1. INITIATE ALLOTMENT (Maker)
+app.post('/api/allotments', (req, res) => {
+    const d = req.body;
+    const sharesCount = parseFloat(d.shares);
+
+    // 1. MASTER FEATURE: Fractional Lock
+    if (!Number.isInteger(sharesCount)) {
+        return res.status(400).json({ message: "Invalid Quantity: Fractional shares (e.g., 0.5) are not permitted in Rammis Bank Registry." });
+    }
+
+    // 2. Fetch Shareholder current balance + branch (Requirement 1.2 & 5.1)
+    db.query("SELECT branch_name, no_of_share FROM shareholders WHERE id = ?", [d.sh_id], async (err, shRes) => {
+        if (err) return res.status(500).json(err);
+        if (!shRes[0]) return res.status(404).json({ message: "Shareholder not found" });
+
+        const currentTotal = shRes[0].no_of_share || 0;
+        const autoSubType = (currentTotal === 0) ? 'Initial' : 'Additional';
+
+        // 3. MASTER FEATURE: Installment Schedule logic
+        let dueDate = null;
+        if (d.payment_status === 'Partial' || d.payment_status === 'Unpaid') {
+            const date = new Date();
+            date.setDate(date.getDate() + 30);
+            dueDate = date.toISOString().split('T')[0];
+        }
+
+        // 4. GENERATE SEQUENTIAL REF (Requirement 5.1)
+        const ref = await generateSequence('ALLOTMENT', shRes[0].branch_name);
+
+        // 5. Calculate value/premium (issue_price defaults to par value 1000 ETB)
+        const issue_price = parseFloat(d.issue_price) || 1000;
+        const totalValue = sharesCount * issue_price;
+        const totalPremium = Math.max(0, totalValue - (sharesCount * 1000));
+
+        const query = `INSERT INTO share_allotments 
+            (allotment_ref, shareholder_id, subscription_type, shares_allotted, next_payment_due_date, total_value, premium, bank_name, bank_ref, payment_status, amount_paid_at_allotment, created_by) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+
+        db.execute(query, [
+            ref, d.sh_id, d.sub_type || autoSubType, sharesCount, dueDate,
+            totalValue, totalPremium, d.bank, d.ref, d.payment_status, d.paid, d.user
+        ], (err) => {
+            if (err) return res.status(500).json({ error: err.sqlMessage });
+            res.json({ success: true, ref });
+        });
+    });
+});
+
+
+// 2. FINAL APPROVAL (Approver - Requirement 3.1)
+app.put('/api/allotments/:id/finalize', async (req, res) => {
+    const { id } = req.params;
+    const admin = req.body.performed_by;
+
+    db.query("SELECT * FROM share_allotments WHERE id = ?", [id], async (err, results) => {
+        const a = results[0];
+
+        try {
+            // Requirement 3.2: Update Shareholder Registry automatically
+            const updateSH = `UPDATE shareholders SET 
+                no_of_share = no_of_share + ?, 
+                no_of_share_birr = no_of_share_birr + ?,
+                paidup_share = (paidup_birr + ?) / 1000,
+                paidup_birr = paidup_birr + ?,
+                status = 'Active' 
+                WHERE id = ?`;
+            
+            await db.promise().execute(updateSH, [a.shares_allotted, a.total_value, a.amount_paid_at_allotment, a.amount_paid_at_allotment, a.shareholder_id]);
+
+            // Mark Allotment as Approved
+            db.execute("UPDATE share_allotments SET status = 'Approved', approver_id = ? WHERE id = ?", [admin, id], () => {
+                res.json({ success: true, message: "Allotment Finalized & Registry Updated" });
+            });
+
+        } catch (e) { res.status(500).json({ error: e.message }); }
+    });
+});
+
+// 1. GET ALLOTMENT REGISTER (History & Pending)
+app.get('/api/allotments', (req, res) => {
+    const query = `
+        SELECT a.*, s.full_name, s.shareholder_id as sh_code 
+        FROM share_allotments a
+        JOIN shareholders s ON a.shareholder_id = s.id
+        ORDER BY a.created_at DESC`;
+    
+    db.query(query, (err, results) => {
+        if (err) return res.status(500).json(err);
+        res.json(results);
+    });
+});
+
+// 2. APPROVE ALLOTMENT (Checker/Approver Action)
+// This implements Requirement 2.3.3 (Automatic Register Update)
+// --- 2.3.3 AUTOMATIC REGISTER UPDATE ENGINE ---
+app.put('/api/allotments/:id/approve', async (req, res) => {
+    const { id } = req.params;
+    const admin = req.body.performed_by;
+
+    db.query("SELECT * FROM share_allotments WHERE id = ?", [id], async (err, results) => {
+        if (err || !results[0]) return res.status(404).json({ message: "Allotment not found" });
+        const a = results[0];
+
+        try {
+            // STEP 1: Get Global Total Shares to calculate percentage (Requirement 3.3)
+            const [totalRes] = await db.promise().execute("SELECT SUM(no_of_share) as bank_total FROM shareholders WHERE status = 'Active'");
+            const currentBankTotal = totalRes[0].bank_total || 0;
+            const newBankTotal = currentBankTotal + a.shares_allotted;
+
+            // STEP 2: Calculate specific shareholder's new totals (Requirement 3.2 & 3.4)
+            const [shRes] = await db.promise().execute("SELECT no_of_share, paidup_share FROM shareholders WHERE id = ?", [a.shareholder_id]);
+            const newShQty = shRes[0].no_of_share + a.shares_allotted;
+            
+            // Recalculate Ownership % (Requirement 3.3)
+            const newPct = (newShQty / newBankTotal) * 100;
+
+            // STEP 3: TRANSACTIONAL UPDATE (Requirement 3.1 & 3.5)
+            // We update the master registry and record the effective date
+            const updateRegistryQuery = `
+                UPDATE shareholders SET 
+                no_of_share = no_of_share + ?, 
+                no_of_share_birr = no_of_share_birr + ?,
+                paidup_share = paidup_share + ?,
+                paidup_birr = paidup_birr + ?,
+                ownership_percentage = ?,
+                status = 'Active',
+                updated_at = NOW()
+                WHERE id = ?`;
+
+            const paidShares = Math.floor(a.amount_paid_at_allotment / 1000);
+
+            await db.promise().execute(updateRegistryQuery, [
+                a.shares_allotted, 
+                a.total_value, 
+                paidShares, 
+                a.amount_paid_at_allotment, 
+                newPct,
+                a.shareholder_id
+            ]);
+
+            // STEP 4: Finalize Allotment Record
+            await db.promise().execute(
+                "UPDATE share_allotments SET status = 'Approved', approver_id = ?, effective_date = NOW() WHERE id = ?", 
+                [admin, id]
+            );
+
+            
+const movementQuery = `
+    INSERT INTO capital_history 
+    (event_type, share_class_id, authorized_capital, board_resolution_no, effective_date, performed_by, action_id) 
+    SELECT 'INCREASE', share_class_id, total_value, allotment_ref, NOW(), ?, ? 
+    FROM share_allotments WHERE id = ?`;
+
+await db.promise().execute(movementQuery, [admin, id, id]);
+
+ 
+            // STEP 5: Audit Log (Section 9)
+            logAction(a.shareholder_id, 'APPROVE', admin, { 
+                event: 'Allotment Approved', 
+                shares: a.shares_allotted, 
+                new_total: newShQty,
+                new_percentage: newPct.toFixed(6) + '%'
+            });
+
+            res.json({ success: true, message: "Registry Updated Successfully" });
+
+        } catch (e) { 
+            console.error(e);
+            res.status(500).json({ error: "Database transaction failed." }); 
+        }
+    });
+});
+
+// 3. REJECT ALLOTMENT
+app.put('/api/allotments/:id/reject', (req, res) => {
+    const { id } = req.params;
+    const { reason, performed_by } = req.body;
+    db.execute("UPDATE share_allotments SET status = 'Rejected', comments = ?, checker_id = ? WHERE id = ?", [reason, performed_by, id], (err) => {
+        if (err) return res.status(500).json(err);
+        res.json({ success: true });
+    });
+});
+
+// --- SHAREHOLDER SEARCH FOR ALLOTMENTS (Requirement 2.3.1) ---
+app.get('/api/shareholders/search-allotment', (req, res) => {
+    const q = req.query.q || '';
+    const searchPattern = `%${q}%`;
+
+    // Search by Name, ID, or Phone (Limited to 10 results for speed)
+    const query = `
+        SELECT id, shareholder_id, full_name, phone, no_of_share 
+        FROM shareholders 
+        WHERE (full_name LIKE ? OR shareholder_id LIKE ? OR phone LIKE ?) 
+        AND status = 'Active' 
+        LIMIT 10`;
+
+    db.execute(query, [searchPattern, searchPattern, searchPattern], (err, results) => {
+        if (err) return res.status(500).json(err);
+        res.json(results);
+    });
+});
+
+// --- FIXED AUDIT SEARCH (Handles slashes in Cert Numbers) ---
+app.get('/api/reports/audit-search', (req, res) => {
+    const certNo = req.query.certNo; // Get from ?certNo=...
+    
+    if (!certNo) return res.status(400).json({ message: "No cert provided" });
+
+    // We search the JSON details for that specific certificate string
+    const query = `
+        SELECT * FROM audit_logs 
+        WHERE details LIKE ? 
+        ORDER BY created_at DESC`;
+        
+    db.execute(query, [`%${certNo}%`], (err, results) => {
+        if (err) {
+            console.error("Audit Query Error:", err);
+            return res.status(500).json(err);
+        }
+        res.json(results);
+    });
+});
+
+app.get('/api/branches', (req, res) => {
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 10;
+    const search = req.query.search || '';
+    const offset = (page - 1) * limit;
+
+    const searchPattern = `%${search}%`;
+
+    const countQuery = "SELECT COUNT(*) as total FROM branches WHERE branch_name LIKE ? OR branch_code LIKE ?";
+    const dataQuery = "SELECT * FROM branches WHERE branch_name LIKE ? OR branch_code LIKE ? ORDER BY branch_name ASC LIMIT ? OFFSET ?";
+
+    db.query(countQuery, [searchPattern, searchPattern], (err, countRes) => {
+        if (err) return res.status(500).json(err);
+        const totalRecords = countRes[0].total;
+
+        db.execute(dataQuery, [searchPattern, searchPattern, limit, offset], (err, results) => {
+            if (err) return res.status(500).json(err);
+            res.json({
+                data: results,
+                pagination: {
+                    totalRecords,
+                    totalPages: Math.ceil(totalRecords / limit),
+                    currentPage: page
+                }
+            });
+        });
+    });
+});
+
+app.post('/api/branches', (req, res) => {
+    const d = req.body;
+
+    // Log for debugging (you can see this in your terminal)
+    console.log("Saving New Branch:", d.branch_name);
+
+    const query = `INSERT INTO branches 
+        (branch_name, branch_code, imal_code, region, district, city) 
+        VALUES (?, ?, ?, ?, ?, ?)`;
+    
+    const values = [
+        d.branch_name, 
+        d.branch_code, 
+        d.imal_code, 
+        d.region, 
+        d.district, 
+        d.city
+    ];
+
+    db.execute(query, values, (err, result) => {
+        if (err) {
+            console.error("❌ SQL Error creating branch:", err.message);
+            // If it's a duplicate branch code, send a clear message
+            if (err.code === 'ER_DUP_ENTRY') {
+                return res.status(400).json({ message: "Branch name or code already exists." });
+            }
+            return res.status(500).json({ error: err.message });
+        }
+        res.json({ success: true, message: "Branch registered successfully" });
+    });
+});
+
+// --- UPDATE BRANCH ---
+app.put('/api/branches/:id', (req, res) => {
+    const { id } = req.params;
+    const d = req.body;
+    const query = `UPDATE branches SET 
+        branch_name = ?, branch_code = ?, imal_code = ?, 
+        region = ?, district = ?, city = ? 
+        WHERE id = ?`;
+    
+    db.execute(query, [d.branch_name, d.branch_code, d.imal_code, d.region, d.district, d.city, id], (err) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json({ success: true, message: "Branch updated successfully" });
+    });
+});
+
+// --- DELETE BRANCH ---
+app.delete('/api/branches/:id', (req, res) => {
+    const { id } = req.params;
+    // Note: In a real system, we'd check if shareholders are assigned to this branch first
+    db.execute("DELETE FROM branches WHERE id = ?", [id], (err) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json({ success: true, message: "Branch removed from network" });
+    });
+});
+// 1. GET ALL TEMPLATES
+app.get('/api/templates', (req, res) => {
+    db.query("SELECT * FROM document_templates", (err, r) => res.json(r));
+});
+
+// 2. UPDATE TEMPLATE CONTENT (Requirement 2.11.11)
+app.put('/api/templates/:key', (req, res) => {
+    const { key } = req.params;
+    const { subject, body, footer } = req.body;
+    const query = "UPDATE document_templates SET subject_line = ?, body_text = ?, footer_text = ? WHERE template_key = ?";
+    db.execute(query, [subject, body, footer, key], (err) => {
+        if (err) return res.status(500).json(err);
+        res.json({ success: true });
+    });
+});
+
+
+app.post('/api/capital/classes', (req, res) => {
+    const d = req.body;
+    const user = d.performed_by || 'Admin';
+
+    const query = `INSERT INTO share_classes 
+        (class_name, par_value, issue_price, voting_rights, dividend_rights, 
+         redemption_rights, conversion_rights, transfer_restrictions, liquidation_priority) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+
+    const values = [
+        d.class_name, 
+        d.par_value || 1000, 
+        d.issue_price || 1000, 
+        d.voting_rights, 
+        d.dividend_rights,
+        d.redemption_rights,
+        d.conversion_rights,
+        d.transfer_restrictions,
+        d.liquidation_priority || 1
+    ];
+
+    db.execute(query, values, (err) => {
+        if (err) return res.status(500).json({ error: err.message });
+        
+        // Log the administrative action
+        logAction('SYSTEM', 'CREATE', user, { event: 'New Share Class Created', name: d.class_name });
+        
+        res.json({ success: true });
+    });
+});
+
+// --- YEARLY PERIODIC REPORTS (Section 8.1) ---
+// --- FIXED YEARLY PERIODIC REPORTS API ---
+app.get('/api/reports/yearly-summary', (req, res) => {
+    const year = req.query.year || new Date().getFullYear();
+
+    const queries = {
+        // 1. Annual Capital Movement
+        movement: `
+            SELECT 
+                DATE_FORMAT(registration_date, '%b') as month,
+                IFNULL(SUM(paidup_birr), 0) as monthly_paidup,
+                IFNULL(SUM(no_of_share_birr), 0) as monthly_subscribed
+            FROM shareholders 
+            WHERE YEAR(registration_date) = ? AND status = 'Active'
+            GROUP BY month ORDER BY registration_date ASC`,
+
+        // 2. FIXED COMPLIANCE QUERY (Section 8.1.3)
+        compliance: `
+            SELECT 
+                /* Pick the latest APPROVED capital limit in history */
+                IFNULL((SELECT authorized_capital FROM capital_history WHERE status = 'Approved' ORDER BY id DESC LIMIT 1), 1) as auth_limit,
+                /* Total cash collected from active members */
+                IFNULL((SELECT SUM(paidup_birr) FROM shareholders WHERE status = 'Active'), 0) as total_paidup
+        `,
+        // 3. Structural Capital Events (Increases/Decreases)
+events: `SELECT event_type, authorized_capital as amount, board_resolution_no, effective_date 
+         FROM capital_history 
+         WHERE status='Approved' AND YEAR(effective_date) = ? 
+         ORDER BY effective_date DESC`
+    };
+
+    db.query(queries.movement, [year], (err, movement) => {
+        if (err) return res.status(500).json(err);
+        db.query(queries.compliance, (err, compliance) => {
+            if (err) return res.status(500).json(err);
+            res.json({
+                movement,
+                compliance: compliance[0],
+                fiscalYear: year
+            });
+        });
+    });
+});
+
+// --- GET LIST OF YEARS FOR REPORTS (Section 8.1 dynamic) ---
+app.get('/api/reports/available-years', (req, res) => {
+    // This query finds all unique years and sorts them newest first
+    const query = `
+        SELECT DISTINCT YEAR(registration_date) as year 
+        FROM shareholders 
+        WHERE registration_date IS NOT NULL 
+        ORDER BY year DESC`;
+
+    db.query(query, (err, results) => {
+        if (err) return res.status(500).json(err);
+        
+        // Extract the year numbers into a simple array: [2026, 2025, 2024...]
+        const years = results.map(r => r.year);
+        
+        // If the database is empty, default to current year so the UI doesn't break
+        if (years.length === 0) years.push(new Date().getFullYear());
+        
+        res.json(years);
+    });
+});
+
+app.get('/api/reports/quarterly-summary', (req, res) => {
+    const queries = {
+        // 1. Ownership Breakdown (Institutional vs Individual)
+        structure: `SELECT type, COUNT(*) as count, IFNULL(SUM(paidup_birr), 0) as value 
+                    FROM shareholders WHERE status='Active' GROUP BY type`,
+        
+        // 2. High-Risk Concentration (NBE Compliance)
+        concentration: `SELECT full_name, shareholder_id, no_of_share,
+                        (no_of_share / (SELECT SUM(no_of_share) FROM shareholders WHERE status='Active') * 100) as ownership_percentage
+                        FROM shareholders WHERE status='Active' 
+                        ORDER BY no_of_share DESC LIMIT 10`,
+        
+        // 3. KYC Audit Status
+// 3. KYC Audit Status
+        kyc: `SELECT 
+                COUNT(*) as total,
+                SUM(CASE WHEN id_doc_path IS NOT NULL AND agreement_doc_path IS NOT NULL THEN 1 ELSE 0 END) as compliant
+              FROM shareholders WHERE status='Active'`,
+
+        // 4. Quarterly Movement (Last 90 days)
+        movement: `SELECT 
+                    SUM(paidup_birr) as total_inflow,
+                    COUNT(*) as new_members
+                   FROM shareholders 
+                   WHERE status='Active' AND registration_date >= DATE_SUB(NOW(), INTERVAL 90 DAY)`,
+
+        // 5. Performance vs Bank Target
+        performance: `SELECT 
+                        (SELECT IFNULL(authorized_capital, 0) FROM capital_history ORDER BY id DESC LIMIT 1) as target,
+                        IFNULL(SUM(paidup_birr), 0) as actual
+                      FROM shareholders WHERE status = 'Active'`
+    };
+
+    const results = {};
+    const keys = Object.keys(queries);
+    let completed = 0;
+
+    keys.forEach(key => {
+        db.query(queries[key], (err, data) => {
+            if (err) console.error(`Error in ${key}:`, err);
+            results[key] = data;
+            completed++;
+            if (completed === keys.length) res.json(results);
+        });
+    });
+});
+
+// GET STAFF PERFORMANCE (Requirement: Target vs Actual)
+app.get('/api/staff/performance', (req, res) => {
+    const query = `
+        SELECT 
+            u.id, u.name,
+            IFNULL(t.target_amount_birr, 0) as target,
+            IFNULL(SUM(s.paidup_birr), 0) as actual,
+            COUNT(s.id) as count_shareholders
+        FROM users u
+        LEFT JOIN staff_targets t ON u.id = t.user_id AND CURDATE() BETWEEN t.start_date AND t.end_date
+        LEFT JOIN shareholders s ON u.id = s.introduced_by AND s.status = 'Active'
+        WHERE u.role IN ('Maker', 'Checker', 'Admin')
+        GROUP BY u.id, u.name, t.target_amount_birr
+        ORDER BY actual DESC`;
+    
+    db.query(query, (err, results) => {
+        if (err) return res.status(500).json(err);
+        res.json(results);
+    });
+});
+
+// SET TARGET API
+app.post('/api/staff/targets', (req, res) => {
+    const { user_id, amount, start, end, created_by } = req.body;
+    const query = "INSERT INTO staff_targets (user_id, target_amount_birr, start_date, end_date, created_by) VALUES (?, ?, ?, ?, ?)";
+    db.execute(query, [user_id, amount, start, end, created_by], (err) => {
+        if (err) return res.status(500).json(err);
+        res.json({ success: true });
+    });
+});
+
+app.get('/api/shareholders/check-exists', (req, res) => {
+    const { field, value } = req.query;
+    // Safety check: Only allow specific columns to be checked
+    const allowed = ['id_number', 'tin', 'email'];
+    if (!allowed.includes(field)) return res.status(400).send();
+
+    db.execute(`SELECT id FROM shareholders WHERE ${field} = ?`, [value], (err, results) => {
+        res.json({ exists: results.length > 0 });
+    });
+});
+
+// 1. GET ALL STAFF WITH THEIR PERFORMANCE & TARGETS
+app.get('/api/staff/targets-overview', (req, res) => {
+    const branch = req.query.branch;
+    if (!branch) return res.json([]);
+
+    const query = `
+        SELECT 
+            u.id as user_id, u.name, u.branch_name, u.role,
+            t.id as target_id,
+            IFNULL(t.target_amount_birr, 0) as current_target,
+            IFNULL(t.recruitment_target, 5) as recruitment_target,
+            t.start_date, t.end_date,
+            (SELECT IFNULL(SUM(paidup_birr), 0) FROM shareholders WHERE introduced_by = u.id AND status = 'Active') as actual_sales,
+            (SELECT COUNT(*) FROM shareholders WHERE introduced_by = u.id AND status = 'Active') as recruitment_count
+        FROM users u
+        /* 
+           Professional Tip: We join the target table without the strict date filter 
+           for the ID, but we keep the date filter for the values 
+        */
+        LEFT JOIN staff_targets t ON u.id = t.user_id 
+             AND t.id = (SELECT id FROM staff_targets WHERE user_id = u.id ORDER BY created_at DESC LIMIT 1)
+        WHERE u.branch_name LIKE ? AND u.is_active = 1
+        ORDER BY actual_sales DESC`;
+    
+    db.query(query, [`%${branch.trim()}%`], (err, results) => {
+        if (err) return res.status(500).json(err);
+        res.json(results);
+    });
+});
+
+// --- 2. NEW: UPDATE TARGET (Professional Edit) ---
+app.put('/api/staff/targets/:id', (req, res) => {
+    const { id } = req.params;
+    const { amount, recruitment_target, start, end, admin } = req.body;
+    const query = "UPDATE staff_targets SET target_amount_birr = ?, recruitment_target = ?, start_date = ?, end_date = ?, created_by = ? WHERE id = ?";
+    db.execute(query, [amount, recruitment_target, start, end, admin, id], (err) => {
+        if (err) return res.status(500).json(err);
+        res.json({ success: true });
+    });
+});
+
+// 2. GET TARGET HISTORY (Performance Audit Trail)
+// --- GET TARGET HISTORY ---
+app.get('/api/staff/targets/history/:user_id', (req, res) => {
+    const query = `SELECT * FROM staff_targets WHERE user_id = ? ORDER BY created_at DESC`;
+    db.execute(query, [req.params.user_id], (err, results) => {
+        if (err) return res.status(500).json(err);
+        res.json(results);
+    });
+});
+
+// 3. REMOVE TARGET (Archival Logic)
+app.delete('/api/staff/targets/:id', (req, res) => {
+    const { id } = req.params;
+    db.execute("DELETE FROM staff_targets WHERE id = ?", [id], (err) => {
+        if (err) return res.status(500).json(err);
+        res.json({ success: true, message: "Target removed" });
+    });
+});
+
+
+// 2. SAVE NEW TARGET
+app.post('/api/staff/set-target', (req, res) => {
+    // 1. Get recruitment_target from the body
+    const { user_id, amount, recruitment_target, start, end, admin } = req.body;
+
+    // 2. Include it in the INSERT query
+    const query = `INSERT INTO staff_targets 
+        (user_id, target_amount_birr, recruitment_target, start_date, end_date, created_by) 
+        VALUES (?, ?, ?, ?, ?, ?)`;
+    
+    db.execute(query, [user_id, amount, recruitment_target, start, end, admin], (err) => {
+        if (err) return res.status(500).json(err);
+        res.json({ success: true });
+    });
+});
+
+app.get('/api/staff/performance-summary', (req, res) => {
+    const { branch, year } = req.query;
+    
+    const query = `
+        SELECT 
+            u.name,
+            u.role,
+            /* Sum of all 4 quarters for this year */
+            (SELECT SUM(target_amount_birr) FROM staff_targets WHERE user_id = u.id AND fiscal_year = ?) as yearly_target,
+            /* Total sales for the entire year */
+            (SELECT SUM(paidup_birr) FROM shareholders WHERE introduced_by = u.id AND YEAR(registration_date) = ?) as yearly_actual,
+            /* Individual Quarters */
+            SUM(CASE WHEN t.quarter = 1 THEN t.target_amount_birr ELSE 0 END) as q1_target,
+            SUM(CASE WHEN t.quarter = 2 THEN t.target_amount_birr ELSE 0 END) as q2_target,
+            SUM(CASE WHEN t.quarter = 3 THEN t.target_amount_birr ELSE 0 END) as q3_target,
+            SUM(CASE WHEN t.quarter = 4 THEN t.target_amount_birr ELSE 0 END) as q4_target
+        FROM users u
+        LEFT JOIN staff_targets t ON u.id = t.user_id AND t.fiscal_year = ?
+        WHERE u.branch_name = ?
+        GROUP BY u.id`;
+
+    db.query(query, [year, year, year, branch], (err, results) => {
+        if (err) return res.status(500).json(err);
+        res.json(results);
+    });
+});
+
+app.get('/api/staff/performance-matrix', (req, res) => {
+    const { branch, year } = req.query;
+    const targetYear = year || new Date().getFullYear();
+
+    const query = `
+        SELECT 
+    u.id as user_id, u.name, u.role,
+    
+    -- Q1 (July - Sept)
+    MAX(CASE WHEN t.quarter = 1 THEN IFNULL(t.target_amount_birr, 0) ELSE 0 END) as q1_target,
+    (SELECT IFNULL(SUM(paidup_birr), 0) FROM shareholders WHERE introduced_by = u.id AND status = 'Active' 
+     AND MONTH(registration_date) IN (7,8,9) AND YEAR(registration_date) = ?) as q1_actual,
+    
+    -- Q2 (Oct - Dec)
+    MAX(CASE WHEN t.quarter = 2 THEN t.target_amount_birr ELSE 0 END) as q2_target,
+    (SELECT IFNULL(SUM(paidup_birr), 0) FROM shareholders WHERE introduced_by = u.id AND status = 'Active' 
+     AND MONTH(registration_date) IN (10,11,12) AND YEAR(registration_date) = ?) as q2_actual,
+    
+    -- Q3 (Jan - March of Next Year)
+    MAX(CASE WHEN t.quarter = 3 THEN t.target_amount_birr ELSE 0 END) as q3_target,
+    (SELECT IFNULL(SUM(paidup_birr), 0) FROM shareholders WHERE introduced_by = u.id AND status = 'Active' 
+     AND MONTH(registration_date) IN (1,2,3) AND YEAR(registration_date) = ? + 1) as q3_actual,
+    
+    -- Q4 (April - June of Next Year)
+    MAX(CASE WHEN t.quarter = 4 THEN t.target_amount_birr ELSE 0 END) as q4_target,
+    (SELECT IFNULL(SUM(paidup_birr), 0) FROM shareholders WHERE introduced_by = u.id AND status = 'Active' 
+     AND MONTH(registration_date) IN (4,5,6) AND YEAR(registration_date) = ? + 1) as q4_actual
+
+FROM users u
+LEFT JOIN staff_targets t ON u.id = t.user_id AND t.fiscal_year = ?
+WHERE u.branch_name = ? AND u.is_active = 1
+GROUP BY u.id, u.name, u.role`;
+
+    db.query(query, [targetYear, targetYear, targetYear, targetYear, targetYear, branch], (err, results) => {
+        if (err) return res.status(500).json(err);
+        res.json(results);
+    });
+});
+
+app.get('/api/reports/monthly-summary', (req, res) => {
+    const month = parseInt(req.query.month) || new Date().getMonth() + 1;
+    const year = parseInt(req.query.year) || new Date().getFullYear();
+
+    const startDate = `${year}-${month.toString().padStart(2, '0')}-01 00:00:00`;
+    const lastDay = new Date(year, month, 0).getDate();
+    const endDate = `${year}-${month.toString().padStart(2, '0')}-${lastDay} 23:59:59`;
+
+ console.log(`📊 Generating Report for: ${startDate} to ${endDate}`);
+ 
+    const queries = {
+        register_activity: `SELECT COUNT(*) as new_verified, SUM(paidup_birr) as value_added 
+                            FROM shareholders WHERE status='Active' 
+                            AND registration_date BETWEEN ? AND ?`,
+
+        capital_summary: `SELECT event_type, SUM(authorized_capital) as amount 
+                          FROM capital_history WHERE status='Approved' 
+                          AND effective_date BETWEEN ? AND ?
+                          GROUP BY event_type`,
+
+        movements: `SELECT transfer_type, COUNT(*) as count, SUM(shares_count) as total_shares 
+                    FROM share_transfers WHERE status='Approved' 
+                    AND effective_date BETWEEN ? AND ?
+                    GROUP BY transfer_type`,
+
+        id_compliance: `SELECT COUNT(*) as total_members,
+                        SUM(CASE WHEN id_doc_path IS NOT NULL THEN 1 ELSE 0 END) as with_id
+                        FROM shareholders WHERE status='Active'`,
+
+        adjustments: `SELECT COUNT(*) as count FROM audit_logs 
+                      WHERE action_type = 'UPDATE' AND created_at BETWEEN ? AND ?`,
+
+        service_income: `SELECT SUM(service_fee) as total_fees FROM share_transfers 
+                         WHERE status='Approved' AND effective_date BETWEEN ? AND ?`
+    };
+
+    const results = {};
+    const keys = Object.keys(queries);
+    let completed = 0;
+
+    keys.forEach(key => {
+        const params = (key === 'id_compliance') ? [] : [startDate, endDate];
+        
+        db.query(queries[key], params, (err, data) => {
+            if (err) return res.status(500).json(err);
+            results[key] = data;
+            completed++;
+            if (completed === keys.length) res.json(results);
+        });
+    });
+});
+
+app.get('/api/reports/weekly-oversight', (req, res) => {
+    const { startDate, endDate } = req.query;
+
+    const queries = {
+        // Activity metrics: what happened within these 7 days
+        weekly_sales: `SELECT COUNT(*) as count, SUM(paidup_birr) as value 
+                       FROM shareholders WHERE status='Active' 
+                       AND registration_date BETWEEN ? AND ?`,
+        
+        exceptions: `SELECT COUNT(*) as count FROM audit_logs 
+                     WHERE action_type = 'REJECT' AND created_at BETWEEN ? AND ?`,
+
+        // Cumulative risk metrics: what is the status of the bank AS OF the end of this week
+        partial_payments: `SELECT COUNT(*) as count, SUM(no_of_share_birr - paidup_birr) as total_debt 
+                           FROM shareholders WHERE paidup_birr < no_of_share_birr 
+                           AND status='Active' AND registration_date <= ?`,
+        
+        incomplete_records: `SELECT COUNT(*) as count FROM shareholders 
+                             WHERE (id_doc_path IS NULL OR phone IS NULL) 
+                             AND status='Active' AND registration_date <= ?`,
+
+        restricted: `SELECT COUNT(*) as count, SUM(pledged_shares) as total_pledged 
+                     FROM shareholders WHERE pledged_shares > 0 AND registration_date <= ?`,
+
+        legal_disputes: `SELECT COUNT(*) as count FROM shareholders 
+                         WHERE (is_frozen = 1 OR under_litigation = 1) AND registration_date <= ?`
+    };
+
+    const results = {};
+    const keys = Object.keys(queries);
+    let completed = 0;
+
+    const params = {
+        weekly_sales: [startDate + " 00:00:00", endDate + " 23:59:59"],
+        exceptions: [startDate + " 00:00:00", endDate + " 23:59:59"],
+        partial_payments: [endDate + " 23:59:59"],
+        incomplete_records: [endDate + " 23:59:59"],
+        restricted: [endDate + " 23:59:59"],
+        legal_disputes: [endDate + " 23:59:59"]
+    };
+
+    keys.forEach(key => {
+        db.query(queries[key], params[key], (err, data) => {
+            if (err) return res.status(500).json(err);
+            results[key] = data;
+            completed++;
+            if (completed === keys.length) res.json(results);
+        });
+    });
+});
+
+app.get('/api/reports/daily-control', (req, res) => {
+    const targetDate = req.query.date || new Date().toISOString().split('T')[0];
+    const start = `${targetDate} 00:00:00`;
+    const end = `${targetDate} 23:59:59`;
+
+    const queries = {
+        // 1. New Registrations today
+        registrations: `SELECT COUNT(*) as count FROM shareholders WHERE registration_date BETWEEN ? AND ?`,
+        
+        // 2. Payments: Sum amount_paid from your capital_payments table
+        payments: `SELECT IFNULL(SUM(amount_paid), 0) as total_cash FROM capital_payments 
+                   WHERE status='Approved' AND created_at BETWEEN ? AND ?`,
+        
+        // 3. Allotments: Sum from your share_allotments table
+        allotments: `SELECT IFNULL(SUM(shares_allotted), 0) as total_shares, IFNULL(SUM(total_value), 0) as total_value 
+                     FROM share_allotments WHERE status='Approved' AND effective_date BETWEEN ? AND ?`,
+
+        // 4. Movement count
+        transfers: `SELECT COUNT(*) as count FROM share_transfers 
+                    WHERE status='Approved' AND effective_date BETWEEN ? AND ?`,
+        
+        // 5. Restrictions (Audit logs)
+        restrictions: `SELECT COUNT(*) as count FROM audit_logs 
+                       WHERE (details LIKE '%frozen%' OR details LIKE '%pledged%') 
+                       AND created_at BETWEEN ? AND ?`,
+
+        // 6. Blocked/Suspicious (Audit logs)
+        suspicious: `SELECT performed_by, action_type, details, created_at FROM audit_logs 
+                     WHERE (action_type='REJECT' OR details LIKE '%Limit Exceeded%') 
+                     AND created_at BETWEEN ? AND ?`,
+
+        // 7. RECONCILIATION LEDGER: Using your exact column names: reference_no, branch_name, allotment_ref
+        reconciliation_ledger: `
+            SELECT 'PAYMENT' as type, amount_paid as value, reference_no as ref, branch_name as info 
+            FROM capital_payments WHERE status='Approved' AND created_at BETWEEN ? AND ?
+            UNION ALL
+            SELECT 'ALLOTMENT' as type, total_value as value, allotment_ref as ref, 'Registry Update' as info 
+            FROM share_allotments WHERE status='Approved' AND effective_date BETWEEN ? AND ?`
+    };
+
+    const results = {};
+    const keys = Object.keys(queries);
+    let completed = 0;
+    let errorSent = false;
+
+    keys.forEach(key => {
+        let params = [start, end];
+        if (key === 'reconciliation_ledger') params = [start, end, start, end];
+
+        db.query(queries[key], params, (err, data) => {
+            if (errorSent) return;
+            if (err) {
+                console.error(`❌ Error in ${key}:`, err.message);
+                errorSent = true;
+                return res.status(500).json({ error: `Database error in ${key}: ${err.message}` });
+            }
+            results[key] = data;
+            completed++;
+            if (completed === keys.length) res.json(results);
+        });
+    });
+});
+
+// --- 2. GET PENDING PAYMENTS FOR CHECKER APPROVAL ---
+app.get('/api/payments/pending', (req, res) => {
+    const query = `
+        SELECT p.*, s.full_name, s.shareholder_id as sh_code, s.phone,
+               (s.no_of_share_birr - s.paidup_birr) as current_outstanding
+        FROM capital_payments p
+        JOIN shareholders s ON p.shareholder_id = s.id
+        WHERE p.status = 'Pending'
+        ORDER BY p.created_at DESC`;
+
+    db.query(query, (err, results) => {
+        if (err) return res.status(500).json(err);
+        res.json(results);
+    });
+});
+
+app.get('/api/payments/:id/receipt-data', (req, res) => {
+    const query = `
+        SELECT 
+            p.*, 
+            s.full_name, s.shareholder_id, s.no_of_share, s.no_of_share_birr, s.bank_account
+        FROM capital_payments p
+        JOIN shareholders s ON p.shareholder_id = s.id
+        WHERE p.id = ?`;
+    
+    db.execute(query, [req.params.id], (err, results) => {
+        if (err || !results[0]) return res.status(404).json({ error: "Not found" });
+        res.json(results[0]);
+    });
+});
+
+app.get('/api/shareholders/:id/payments', (req, res) => {
+    const shId = req.params.id;
+    const query = "SELECT * FROM capital_payments WHERE shareholder_id = ? ORDER BY created_at DESC";
+    db.execute(query, [shId], (err, results) => {
+        if (err) return res.status(500).json(err);
+        res.json(results);
+    });
+});
+
+// Get all system parameters
+app.get('/api/parameters', (req, res) => {
+    db.query("SELECT * FROM system_parameters", (err, results) => {
+        if (err) return res.status(500).json(err);
+        res.json(results);
+    });
+});
+
+// Update a parameter
+app.post('/api/parameters/update', (req, res) => {
+    const { param_key, param_value, performed_by } = req.body;
+    const query = "UPDATE system_parameters SET param_value = ? WHERE param_key = ?";
+    
+    db.execute(query, [param_value, param_key], (err) => {
+        if (err) return res.status(500).json(err);
+        
+        logAction('SYSTEM', 'UPDATE_PARAM', performed_by, { 
+            key: param_key, 
+            new_value: param_value,
+            info: `System parameter ${param_key} modified`
+        });
+        res.json({ success: true });
+    });
+});
+
+// --- 2. SALES AGENTS ROUTES ---
+app.get('/api/agents', (req, res) => {
+    db.query("SELECT * FROM sales_agents WHERE is_active = 1", (err, results) => {
+        if (err) return res.status(500).json(err);
+        res.json(results);
+    });
+});
+
+// --- UPDATED: ADD AGENT WITH FILE UPLOAD ---
+app.post('/api/agents', upload.single('agreement_doc'), (req, res) => {
+    const { name, code, phone } = req.body;
+    const file = req.file; // The uploaded agreement
+
+    if (!name || !code) {
+        return res.status(400).json({ error: "Agent Name and Code are required." });
+    }
+
+    // Capture filename if it exists
+    const agreementPath = file ? file.filename : null;
+
+    const query = "INSERT INTO sales_agents (agent_name, agent_code, phone, agreement_path) VALUES (?, ?, ?, ?)";
+    
+    db.execute(query, [name, code, phone, agreementPath], (err, result) => {
+        if (err) {
+            console.error("Database Error:", err);
+            if (err.code === 'ER_DUP_ENTRY') return res.status(400).json({ error: "Agent Code already exists." });
+            return res.status(500).json({ error: "Database failed to save agent." });
+        }
+        res.json({ success: true });
+    });
+});
+
+// --- 1. UPDATE AGENT (Edit) ---
+// --- UPDATED: EDIT AGENT WITH OPTIONAL FILE REPLACEMENT ---
+app.put('/api/agents/:id', upload.single('agreement_doc'), (req, res) => {
+    const { id } = req.params;
+    const { name, code, phone } = req.body;
+    const file = req.file;
+
+    // Logic: If a new file is uploaded, use it. Otherwise, keep the query simple.
+    let query = "UPDATE sales_agents SET agent_name = ?, agent_code = ?, phone = ?";
+    let params = [name, code, phone];
+
+    if (file) {
+        query += ", agreement_path = ?";
+        params.push(file.filename);
+    }
+
+    query += " WHERE id = ?";
+    params.push(id);
+
+    db.execute(query, params, (err) => {
+        if (err) {
+            if (err.code === 'ER_DUP_ENTRY') return res.status(400).json({ error: "Code already in use" });
+            return res.status(500).json({ error: "Failed to update agent" });
+        }
+        res.json({ success: true });
+    });
+});
+
+// --- 2. SOFT DELETE AGENT (Deactivate) ---
+app.delete('/api/agents/:id', (req, res) => {
+    const { id } = req.params;
+    // We set is_active to 0 instead of deleting the row
+    const query = "UPDATE sales_agents SET is_active = 0 WHERE id = ?";
+    db.execute(query, [id], (err) => {
+        if (err) return res.status(500).json({ error: "Failed to deactivate agent" });
+        res.json({ success: true, message: "Agent deactivated" });
+    });
+});
+
+app.post('/api/agents/withdraw', async (req, res) => {
+    const { agent_id, amount, ref, user } = req.body;
+    const withdrawAmt = parseFloat(amount);
+
+    try {
+        const [[agent]] = await db.promise().execute("SELECT current_balance, agent_name FROM sales_agents WHERE id = ?", [agent_id]);
+        
+        if (agent.current_balance < withdrawAmt) {
+            return res.status(400).json({ error: "Insufficient Balance: You cannot withdraw more than the available commission." });
+        }
+
+        // Subtract and Log
+        await db.promise().execute("UPDATE sales_agents SET current_balance = current_balance - ? WHERE id = ?", [withdrawAmt, agent_id]);
+        
+        await db.promise().execute(
+            "INSERT INTO agent_payouts (agent_id, amount_withdrawn, reference_no, performed_by) VALUES (?, ?, ?, ?)",
+            [agent_id, withdrawAmt, ref, user]
+        );
+
+        logAction('AGENT', 'PAYOUT', user, { agent: agent.agent_name, amount: withdrawAmt, ref: ref });
+
+        res.json({ success: true });
+    } catch (err) { res.status(500).json(err); }
+});
+
+// --- GET FULL PAYMENT HISTORY FOR A SHAREHOLDER ---
+app.get('/api/shareholders/:id/payment-history', (req, res) => {
+    const shId = req.params.id;
+    // We fetch everything: amount, fees, agent commission, and status
+    const query = `
+        SELECT * FROM capital_payments 
+        WHERE shareholder_id = ? 
+        ORDER BY payment_date DESC, created_at DESC`;
+    
+    db.execute(query, [shId], (err, results) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(results);
+    });
+});
+
+// 1. MASTER PAYMENT LEDGER (Every slip ever recorded)
+app.get('/api/reports/payment-ledger', (req, res) => {
+    const { search, startDate, endDate } = req.query;
+    const searchPattern = `%${search || ''}%`;
+
+    // Query 1: Overall Summary (Requirement 8.5)
+    const summaryQuery = `
+        SELECT 
+            IFNULL(SUM(no_of_share_birr), 0) as total_subscribed,
+            IFNULL(SUM(paidup_birr), 0) as total_paid,
+            IFNULL(SUM(no_of_share_birr - paidup_birr), 0) as total_outstanding
+        FROM shareholders WHERE status = 'Active'`;
+
+    // Query 2: Detailed Ledger
+    let ledgerQuery = `
+        SELECT p.*, s.full_name, s.shareholder_id as sh_code
+        FROM capital_payments p
+        JOIN shareholders s ON p.shareholder_id = s.id
+        WHERE (s.full_name LIKE ? OR p.reference_no LIKE ?)
+    `;
+    const ledgerParams = [searchPattern, searchPattern];
+
+    if (startDate && endDate) {
+        ledgerQuery += ` AND p.payment_date BETWEEN ? AND ?`;
+        ledgerParams.push(startDate, endDate);
+    }
+    ledgerQuery += ` ORDER BY p.payment_date DESC`;
+
+    // Execute both and return as one object
+    db.query(summaryQuery, (err, summaryResults) => {
+        if (err) return res.status(500).json(err);
+        
+        db.query(ledgerQuery, ledgerParams, (err, ledgerResults) => {
+            if (err) return res.status(500).json(err);
+            
+            res.json({
+                summary: summaryResults[0],
+                ledger: ledgerResults
+            });
+        });
+    });
+});
+
+// 2. COLLECTION STATUS (Who owes the bank money?)
+app.get('/api/reports/collection-summary', (req, res) => {
+    const query = `
+        SELECT 
+            COUNT(*) as total_shareholders,
+            SUM(no_of_share_birr) as total_subscribed,
+            SUM(paidup_birr) as total_paid,
+            SUM(no_of_share_birr - paidup_birr) as total_outstanding,
+            SUM(service_charge_amt) as total_service_fees
+        FROM shareholders WHERE status = 'Active'`;
+    
+    db.query(query, (err, results) => {
+        if (err) return res.status(500).json(err);
+        res.json(results[0]);
+    });
+});
+
+// --- GET SINGLE SHAREHOLDER DETAILS BY ID ---
+app.get('/api/shareholders/profile/:id', (req, res) => {
+    const query = `
+        SELECT id, shareholder_id, full_name, tin, phone, 
+               no_of_share_birr, paidup_birr 
+        FROM shareholders WHERE id = ?`;
+    db.execute(query, [req.params.id], (err, results) => {
+        if (err || results.length === 0) return res.status(404).json({ error: "Not found" });
+        res.json(results[0]);
+    });
+});
+
+app.put('/api/shareholders/:id/nbe-finalize', async (req, res) => {
+    const { id } = req.params;
+    const user = req.body.performed_by;
+
+    try {
+        // 1. Move to Active AND change phase to Pre-Cutoff so they leave the staging list
+        const query = `
+            UPDATE shareholders 
+            SET status = 'Active', 
+                registration_phase = 'Pre-Cutoff', 
+                nbe_approval_date = NOW(), 
+                approved_by = ? 
+            WHERE id = ?`;
+        
+        const [result] = await db.promise().execute(query, [user, id]);
+
+        if (result.affectedRows === 0) {
+            return res.status(404).json({ success: false, message: "Shareholder not found." });
+        }
+
+        // 2. Recalculate Ownership for the whole bank
+        const [totalRes] = await db.promise().execute("SELECT SUM(no_of_share) as bank_total FROM shareholders WHERE status = 'Active'");
+        const newBankTotal = totalRes[0].bank_total || 1;
+
+        await db.promise().execute(
+            "UPDATE shareholders SET ownership_percentage = (no_of_share / ?) * 100 WHERE status = 'Active'",
+            [newBankTotal]
+        );
+
+        res.json({ success: true });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: "Promotion failed at database level." });
+    }
+});
+
+app.get('/api/shareholders/nbe-staging', (req, res) => {
+    const query = `SELECT * FROM shareholders 
+                   WHERE status = 'Pending NBE Approval' OR registration_phase = 'Post-Nov-24'
+                   ORDER BY registration_date DESC`;
+    db.query(query, (err, results) => {
+        if (err) return res.status(500).json(err);
+        res.json(results);
+    });
+});
+
+// --- BULK NBE PROMOTION (Requirement: Regulatory Batch Processing) ---
+app.post('/api/shareholders/nbe-bulk-finalize', async (req, res) => {
+    const { ids, performed_by } = req.body; // ids is an array [1, 2, 5, ...]
+
+    if (!ids || ids.length === 0) return res.status(400).json({ message: "No selection made." });
+
+    try {
+        // 1. Promote all selected IDs in one query
+        const query = `
+            UPDATE shareholders 
+            SET status = 'Active', 
+                registration_phase = 'Pre-Cutoff', 
+                nbe_approval_date = NOW(), 
+                approved_by = ? 
+            WHERE id IN (?)`;
+        
+        await db.promise().query(query, [performed_by, ids]);
+
+        // 2. RECALCULATE GLOBAL OWNERSHIP (One time for efficiency)
+        const [totalRes] = await db.promise().execute("SELECT SUM(no_of_share) as bank_total FROM shareholders WHERE status = 'Active'");
+        const newBankTotal = totalRes[0].bank_total || 1;
+
+        await db.promise().execute(
+            "UPDATE shareholders SET ownership_percentage = (no_of_share / ?) * 100 WHERE status = 'Active'",
+            [newBankTotal]
+        );
+
+        // 3. Log the Bulk Action
+        logAction('SYSTEM', 'NBE_BULK_PROMOTION', performed_by, { 
+            count: ids.length, 
+            info: `Batch promotion of ${ids.length} shareholders completed.` 
+        });
+
+        res.json({ success: true, message: `Successfully promoted ${ids.length} members.` });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: "Bulk promotion failed." });
+    }
+});
+
+// --- SMS GATEWAY HELPER ---
+// --- UPGRADED SMS HELPER WITH LOGGING ---
+const sendSMS = async (phone, text) => {
+    let status = 'SIMULATED';
+    
+    try {
+        // 1. Fetch config from DB
+        const [params] = await db.promise().execute(
+            "SELECT param_key, param_value FROM system_parameters WHERE category = 'SMS'"
+        );
+
+        // 2. USE ENVIRONMENT VARIABLES AS FALLBACK (Professional Security)
+        // This tells recruiters you know how to handle secrets securely
+        const config = {
+            url: params.find(p => p.param_key === 'sms_gateway_url')?.param_value || process.env.SMS_URL,
+            user: params.find(p => p.param_key === 'sms_username')?.param_value || process.env.SMS_USER,
+            pass: params.find(p => p.param_key === 'sms_password')?.param_value || process.env.SMS_PASS,
+            from: params.find(p => p.param_key === 'sms_sender_id')?.param_value || process.env.SMS_SENDER,
+            isEnabled: params.find(p => p.param_key === 'sms_enabled')?.param_value === '1'
+        };
+
+        // 3. RECRUITER CHECK: Logic for non-live mode
+        if (!config.isEnabled) {
+            console.log(`[SIMULATION] SMS to ${phone}: ${text}`);
+            await db.promise().execute(
+                "INSERT INTO sms_logs (recipient_phone, message_text, status) VALUES (?, ?, 'SIMULATED')", 
+                [phone, text]
+            );
+            return { success: true, status: 'SIMULATED' };
+        }
+
+        // 4. LIVE DISPATCH (Only if enabled)
+        // Ensure phone is cleaned of spaces or dashes
+        const cleanPhone = phone.replace(/\D/g, ''); 
+        const encodedText = encodeURIComponent(text);
+        
+        const fullUrl = `${config.url}?username=${config.user}&password=${config.pass}&from=${config.from}&to=${cleanPhone}&text=${encodedText}`;
+        
+        await axios.get(fullUrl);
+        status = 'SENT';
+
+        // 5. AUDIT LOGGING
+        await db.promise().execute(
+            "INSERT INTO sms_logs (recipient_phone, message_text, status) VALUES (?, ?, ?)", 
+            [phone, text, status]
+        );
+        return { success: true, status };
+
+    } catch (err) {
+        console.error("SMS Dispatch Failure:", err.message);
+        // Log failure to DB for troubleshooting
+        await db.promise().execute(
+            "INSERT INTO sms_logs (recipient_phone, message_text, status, error_log) VALUES (?, ?, 'FAILED', ?)", 
+            [phone, text, err.message]
+        );
+        return { success: false, error: err.message };
+    }
+};
+
+// --- BULK SMS ROUTE ---
+app.post('/api/sms/bulk-send', async (req, res) => {
+    const { message, recipientIds } = req.body; // recipientIds is an array [1, 2, 3]
+
+    try {
+        const [shareholders] = await db.promise().query("SELECT phone, full_name FROM shareholders WHERE id IN (?)", [recipientIds]);
+        
+        // Loop through and send
+        for (let sh of shareholders) {
+            let customizedMsg = message.replace('[NAME]', sh.full_name);
+            await sendSMS(sh.phone, customizedMsg);
+        }
+
+        res.json({ success: true, count: shareholders.length });
+    } catch (err) { res.status(500).json(err); }
+});
+
+// Routes for Templates
+app.get('/api/sms/templates', (req, res) => {
+    db.query("SELECT * FROM sms_templates", (err, r) => res.json(r));
+});
+
+app.put('/api/sms/templates/:id', (req, res) => {
+    db.execute("UPDATE sms_templates SET message_body = ? WHERE id = ?", [req.body.body, req.params.id], (err) => res.json({success: true}));
+});
+
+// --- 1. SINGLE SMS SEND ROUTE ---
+app.post('/api/sms/send-single', async (req, res) => {
+    const { phone, message, sh_id } = req.body;
+    
+    const result = await sendSMS(phone, message); // Uses our existing helper with Logging
+    
+    if (result.success) {
+        res.json({ success: true, status: result.status });
+    } else {
+        res.status(500).json({ success: false, error: result.error });
+    }
+});
+
+// --- 2. GET RECIPIENTS DATA ---
+app.post('/api/sms/prepare-broadcast', async (req, res) => {
+    const { recipientIds } = req.body;
+    try {
+        const [shareholders] = await db.promise().query(
+            "SELECT id, phone, full_name FROM shareholders WHERE id IN (?)", 
+            [recipientIds]
+        );
+        res.json(shareholders);
+    } catch (err) { res.status(500).json(err); }
+});
+
+// --- GET SMS AUDIT LOGS ---
+app.get('/api/sms/logs', (req, res) => {
+    // Fetch latest 100 logs
+    const query = "SELECT * FROM sms_logs ORDER BY created_at DESC LIMIT 100";
+    db.query(query, (err, results) => {
+        if (err) return res.status(500).json(err);
+        res.json(results);
+    });
+});
+
+// --- ENTERPRISE SMS BATCH PROCESSOR ---
+const processSMSQueue = async () => {
+    // 1. Pick the next batch of PENDING or RETRYING messages
+    const [queue] = await db.promise().query(
+        "SELECT * FROM sms_logs WHERE status IN ('PENDING', 'RETRYING') AND retry_count < 3 LIMIT 5"
+    );
+
+    if (queue.length === 0) return;
+
+    const [params] = await db.promise().execute("SELECT param_key, param_value FROM system_parameters WHERE category = 'SMS'");
+    const config = {
+        url: params.find(p => p.param_key === 'sms_gateway_url')?.param_value,
+        user: params.find(p => p.param_key === 'sms_username')?.param_value,
+        pass: params.find(p => p.param_key === 'sms_password')?.param_value,
+        from: params.find(p => p.param_key === 'sms_sender_id')?.param_value,
+        isLive: params.find(p => p.param_key === 'sms_enabled')?.param_value === '1'
+    };
+
+    for (let msg of queue) {
+        try {
+            if (config.isLive) {
+                // Add DLR (Delivery Receipt) mask for Kannel
+                // dlrmask=31 means we want all status updates (Delivered, Buffered, etc.)
+                const dlrUrl = encodeURIComponent(`http://your-server-ip:5000/api/sms/dlr?logId=${msg.id}`);
+                const fullUrl = `${config.url}?username=${config.user}&password=${config.pass}&from=${config.from}&to=${msg.recipient_phone}&text=${encodeURIComponent(msg.message_text)}&dlr-mask=31&dlr-url=${dlrUrl}`;
+                
+                const response = await axios.get(fullUrl);
+                // Assume Kannel returns something like "0: Accepted for delivery"
+                await db.promise().execute(
+                    "UPDATE sms_logs SET status = 'SENT', provider_msg_id = ?, last_attempt = NOW() WHERE id = ?", 
+                    [response.data, msg.id]
+                );
+            } else {
+                await db.promise().execute("UPDATE sms_logs SET status = 'SENT', last_attempt = NOW() WHERE id = ?", [msg.id]);
+            }
+        } catch (err) {
+            // RETRY LOGIC WITH BACKOFF
+            const newRetryCount = msg.retry_count + 1;
+            const newStatus = newRetryCount >= 3 ? 'FAILED' : 'RETRYING';
+            await db.promise().execute(
+                "UPDATE sms_logs SET status = ?, retry_count = ?, error_log = ?, last_attempt = NOW() WHERE id = ?",
+                [newStatus, newRetryCount, err.message, msg.id]
+            );
+        }
+    }
+};
+
+// Run the worker every 2 seconds
+setInterval(processSMSQueue, 2000);
+
+// --- DLR CALLBACK ROUTE (Kannel hits this when phone receives SMS) ---
+app.get('/api/sms/dlr', (req, res) => {
+    const { logId, status } = req.query; 
+    // Kannel status codes: 1=Delivered, 2=Failed, 8=Submitted
+    const finalStatus = status == '1' ? 'DELIVERED' : (status == '2' ? 'FAILED' : 'SENT');
+    
+    db.execute("UPDATE sms_logs SET status = ? WHERE id = ?", [finalStatus, logId], () => {
+        res.sendStatus(200);
+    });
+});
+
+app.post('/api/sms/queue-campaign', async (req, res) => {
+    const { message, recipientIds } = req.body;
+    const campaignId = 'CAMP-' + Date.now();
+
+    try {
+        const [shareholders] = await db.promise().query("SELECT phone, full_name FROM shareholders WHERE id IN (?)", [recipientIds]);
+        
+        const values = shareholders.map(sh => [
+            sh.phone, 
+            message.replace('[NAME]', sh.full_name), 
+            'PENDING', 
+            campaignId
+        ]);
+
+        await db.promise().query(
+            "INSERT INTO sms_logs (recipient_phone, message_text, status, campaign_id) VALUES ?", 
+            [values]
+        );
+
+        res.json({ success: true, campaignId });
+    } catch (err) { res.status(500).json(err); }
+});
+
+app.listen(5000, () => console.log("Server running on port 5000 - Fully Synchronized"));

@@ -1,0 +1,23 @@
+# Environment files / secrets
+.env
+.env.*
+!.env.example
+
+# Dependencies
+node_modules/
+
+# Build files
+dist/
+build/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Uploaded documents
+backend/documents/*
+!backend/documents/.gitkeep
+
+# Logs
+*.log
+npm-debug.log*
