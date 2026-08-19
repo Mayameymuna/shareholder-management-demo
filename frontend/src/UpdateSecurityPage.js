@@ -136,7 +136,7 @@ const handleUpdate = async (e) => {
           </form>
           
           <div className="flex justify-center gap-6 mt-12 text-[10px] font-bold text-slate-200 tracking-widest uppercase">
-             <span>© 2026 Rammis Bank.</span> <span>Developed by Murad Amin</span>
+             <span>© 2026 Rammis Bank.</span> <span>Developed by Meymuna Ahmed</span>
           </div>
         </div>
       </div>
